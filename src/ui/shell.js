@@ -1,51 +1,49 @@
 'use strict';
-/* 应用窗口标题栏：只有 旋转 / 最小化 / 最大化 / 关闭，其余设置都在 ApkStart 主界面 */
-const api = window.apkstart;
-const $ = (id) => document.getElementById(id);
+(() => {
+  const titleEl = document.getElementById('title');
+  const iconEl = document.getElementById('appIcon');
+  const bootIconEl = document.getElementById('bootIcon');
+  const bootNameEl = document.getElementById('bootName');
+  const tipEl = document.getElementById('tip');
+  const bootEl = document.getElementById('boot');
+  const btnRotate = document.getElementById('btnRotate');
+  const orientText = document.getElementById('orientText');
 
-const btn = {
-  rotate: $('btnRotate'),
-  min: $('btnMin'),
-  max: $('btnMax'),
-  close: $('btnClose'),
-};
-
-btn.rotate.addEventListener('click', () => api.shell.rotate());
-btn.min.addEventListener('click', () => api.shell.minimize());
-btn.max.addEventListener('click', () => api.shell.maximize());
-btn.close.addEventListener('click', () => api.shell.close());
-
-// 标题栏上右键不要弹出 Chromium 的网页菜单；画面区域的右键已由主进程
-// 拦下并映射成「安卓返回」，这里补掉外壳这一圈。
-window.addEventListener('contextmenu', (e) => e.preventDefault());
-
-// Ctrl+R 旋转，F11 最大化（和 Windows 习惯一致）
-window.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); api.shell.rotate(); }
-  else if (e.key === 'F11') { e.preventDefault(); api.shell.maximize(); }
-  else if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); api.shell.back(); }
-  else if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); api.shell.forward(); }
-});
-
-function applyState(s) {
-  if (!s) return;
-  $('appName').textContent = s.label || '应用';
-  $('bootName').textContent = s.label || '';
-  const icon = s.iconUrl || '';
-  if (icon) {
-    $('appIcon').src = icon;
-    $('bootIcon').src = icon;
-  }
-  $('bootTip').textContent = s.tip || '';
-  if (s.ready) {
-    const boot = $('boot');
-    if (boot) {
-      boot.classList.add('out');
-      setTimeout(() => { boot.style.display = 'none'; }, 420);
+  function applyState(s) {
+    if (!s) return;
+    if (s.label) {
+      titleEl.textContent = s.label;
+      bootNameEl.textContent = s.label;
+      document.title = s.label;
     }
-    document.body.style.background = '#0b0c0e';
+    if (s.iconUrl) {
+      iconEl.src = s.iconUrl;
+      iconEl.style.display = 'block';
+      bootIconEl.src = s.iconUrl;
+    }
+    if ('tip' in s && s.tip) tipEl.textContent = s.tip;
+    if ('ready' in s) {
+      if (s.ready) bootEl.classList.add('hide');
+      else bootEl.classList.remove('hide');
+    }
+    if ('landscape' in s) {
+      btnRotate.classList.toggle('on', Boolean(s.landscape));
+      orientText.textContent = s.landscape ? 'Portrait' : 'Landscape';
+    }
   }
-}
 
-api.shell.onState(applyState);
-api.shell.state().then(applyState).catch(() => {});
+  btnRotate.addEventListener('click', () => window.apkstart.shellRotate());
+  document.getElementById('btnMin').addEventListener('click', () => window.apkstart.shellMin());
+  document.getElementById('btnMax').addEventListener('click', () => window.apkstart.shellMax());
+  document.getElementById('btnClose').addEventListener('click', () => window.apkstart.shellClose());
+
+  window.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.key.toLowerCase() === 'r') {
+      e.preventDefault();
+      window.apkstart.shellRotate();
+    }
+  });
+
+  window.apkstart.onShellState(applyState);
+  window.apkstart.shellReady().then(applyState);
+})();

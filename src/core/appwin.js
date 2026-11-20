@@ -1,385 +1,270 @@
 'use strict';
 /**
- * 应用窗口：一个正在运行的安卓应用 = 一个干净的 Windows 窗口。
+ * Dedicated per-app host window (`AppWindow`).
  *
- * 窗口里只有顶部一条 38px 的标题栏（旋转 / 最小化 / 最大化 / 关闭），
- * 下面的整块画面是嵌进来的模拟器窗口（SetParent），所以看不到安卓桌面、
- * 看不到模拟器自带的侧边工具栏，也不会多出第二个任务栏图标。
+ * Provides a clean 38px custom title bar (`shell.html`: Rotate / Minimize / Maximize / Close)
+ * and embeds the Android Emulator Qt framebuffer window directly beneath Chromium's
+ * `Chrome_RenderWidgetHostHWND` child window via `WinAgent`.
  */
-const { BrowserWindow, screen, nativeImage } = require('electron');
-const fs = require('fs');
 const path = require('path');
-const { hookOptions } = require('./pointer');
-const store = require('./store');
+const { BrowserWindow, screen, nativeImage } = require('electron');
 
-const TITLEBAR_H = 38;
-/**
- * 模拟器窗口四周自带 8px 的灰色内边距（Qt 的边框留白），
- * 而真正的 LCD 画面是从 +8px 开始的。把子窗口整体放大 16px 并向左上偏移 8px，
- * 这圈灰边就正好被推到客户区外面，画面干净地贴满四周。
- */
-const EMU_PAD = 8;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TITLE_BAR = 38;
+const PAD = 8;
 
-function iconUrl(p) {
-  if (!p || !fs.existsSync(p)) return '';
-  return `file:///${p.replace(/\\/g, '/').replace(/ /g, '%20')}?v=${fs.statSync(p).mtimeMs}`;
+function hwndInt(win) {
+  const b = win.getNativeWindowHandle();
+  if (b.length >= 8 && typeof b.readBigUInt64LE === 'function') {
+    return Number(b.readBigUInt64LE(0));
+  }
+  return b.readUInt32LE(0);
 }
 
 class AppWindow {
-  constructor({ agent, setOrientation, mouseHook = false, pointerConfig = null }) {
+  constructor({ agent, setOrientation, pointerConfig, onRestart }) {
     this.agent = agent;
-    this.setOrientation = setOrientation || null;
-    // 全局鼠标钩子只在「应用窗口前台 + 至少一项映射开启」时安装。
-    // pointerConfig 传函数：设置页改了开关，下一次 focus 就生效，不用重启。
-    this.mouseHook = mouseHook;
-    this.pointerConfig = pointerConfig;
+    this.setOrientation = setOrientation || (async () => {});
+    this.pointerConfig = typeof pointerConfig === 'function' ? pointerConfig : () => ({ enabled: false });
+    this.onRestart = onRestart || null;
     this.win = null;
     this.pkg = null;
-    this.state = { label: '', tip: '', ready: false, landscape: false };
+    this.landscape = false;
+    this.embedded = false;
+    this.lastEmbedError = '';
+    this.portrait = { w: 540, h: 960 };
+    this.state = { label: '', pkg: '', landscape: false, ready: false, tip: 'Starting...' };
     this._fitTimer = null;
-    this._closedCb = null;
+    this._onCloseApp = null;
+    this._suppressCloseHook = false;
+    this._rotating = false;
+    this.iconUrl = '';
   }
 
-  get isOpen() { return !!(this.win && !this.win.isDestroyed()); }
+  onCloseApp(fn) { this._onCloseApp = fn; }
 
-  /** 竖屏 / 横屏下窗口内容的目标尺寸（自动缩放到屏幕内） */
-  static sizeFor(area, portrait, landscape) {
-    const p = portrait || { w: 540, h: 960 };
-    // 留足边距：标题栏 38 + 上下各 24，左右各 40
-    const availH = Math.max(360, (area.h || 1040) - TITLEBAR_H - 48);
-    const availW = Math.max(300, (area.w || 1920) - 80);
-    const k = landscape
-      ? Math.min(availW / p.h, availH / p.w)
-      : Math.min(availH / p.h, availW / p.w);
-    const w = Math.round((landscape ? p.h : p.w) * k);
-    const h = Math.round((landscape ? p.w : p.h) * k);
-    // 双保险：绝不超过屏幕可用区，否则会被系统裁掉，看起来就是「有黑边 / 没填满」
-    return {
-      w: Math.max(320, Math.min(w, Math.round(availW))),
-      h: Math.max(360, Math.min(h, Math.round(availH))),
-    };
+  get isOpen() { return Boolean(this.win && !this.win.isDestroyed()); }
+
+  get isForeground() {
+    return Boolean(this.isOpen && this.win.isVisible() && !this.win.isMinimized() && this.win.isFocused());
   }
 
-  _area() {
-    const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-    const a = d.workArea || d.bounds;
-    return { x: a.x, y: a.y, w: a.width, h: a.height };
+  refreshPointer() {
+    if (!this.agent) return;
+    const raw = this.pointerConfig() || {};
+    const game = raw.priorityMode === 'game';
+    const opts = this.isForeground
+      ? raw
+      : { enabled: false };
+    this.agent.setHook(Boolean(opts.enabled && !game), opts).catch(() => {});
   }
 
-  _scale() {
-    try {
-      const b = this.win ? this.win.getBounds() : this._area();
-      return screen.getDisplayMatching(b).scaleFactor || 1;
-    } catch (_) {
-      return 1;
-    }
-  }
+  open({ pkg, label, iconPath, portrait, fullscreen, landscape = false }) {
+    this.pkg = pkg;
+    if (portrait) this.portrait = portrait;
+    this.landscape = Boolean(landscape);
 
-  /**
-   * 打开（或复用）应用窗口。
-   * @param {object} o { pkg, label, iconPath, portrait, fullscreen, onClosed }
-   */
-  open(o) {
-    const { pkg, label, iconPath, portrait, fullscreen } = o;
-    this._closedCb = o.onClosed || null;
-    if (this.isOpen && this.pkg === pkg) {
+    const area = screen.getPrimaryDisplay().workArea;
+    const ratio = this.landscape
+      ? this.portrait.h / this.portrait.w
+      : this.portrait.w / this.portrait.h;
+    const clientH = Math.round(area.height * 0.86) - TITLE_BAR;
+    const clientW = Math.round(clientH * ratio);
+    const totalH = clientH + TITLE_BAR;
+    const x = area.x + Math.round((area.width - clientW) / 2);
+    const y = area.y + Math.round((area.height - totalH) / 2);
+
+    if (!this.isOpen) {
+      this.embedded = false;
+      this.win = new BrowserWindow({
+        x, y,
+        width: clientW,
+        height: totalH,
+        minWidth: 360,
+        minHeight: 520,
+        frame: false,
+        show: true,
+        backgroundColor: '#111317',
+        title: label || 'ApkStart',
+        icon: iconPath ? nativeImage.createFromPath(iconPath) : undefined,
+        webPreferences: {
+          preload: path.join(__dirname, '..', 'preload.js'),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: false,
+          spellcheck: false,
+        },
+      });
+      this.win.loadFile(path.join(__dirname, '..', 'ui', 'shell.html'));
+      this.win.on('resize', () => this.scheduleFit(2));
+      this.win.on('maximize', () => this.scheduleFit(6));
+      this.win.on('unmaximize', () => this.scheduleFit(6));
+      this.win.on('move', () => this.scheduleFit());
+      this.win.on('focus', () => this.refreshPointer());
+      this.win.on('blur', () => this.refreshPointer());
+      this.win.on('minimize', () => this.refreshPointer());
+      this.win.on('hide', () => this.refreshPointer());
+      this.win.on('closed', () => {
+        const closedPkg = this.pkg;
+        const suppress = this._suppressCloseHook;
+        this._suppressCloseHook = false;
+        this.win = null;
+        this.embedded = false;
+        this.agent.setHook(false).catch(() => {});
+        this.agent.park().catch(() => {});
+        if (!suppress && closedPkg && this._onCloseApp) {
+          try { this._onCloseApp(closedPkg); } catch (_) { /* ignore */ }
+        }
+      });
+    } else {
+      this.win.setTitle(label || 'ApkStart');
+      if (iconPath) this.win.setIcon(nativeImage.createFromPath(iconPath));
+      if (!fullscreen && !this.win.isMaximized()) {
+        this.win.setBounds({ x, y, width: clientW, height: totalH });
+      }
       this.win.show();
       this.win.focus();
-      return this.win;
     }
-    this.close({ keepApp: true });
-
-    this.pkg = pkg;
-    this.portrait = portrait || { w: 540, h: 960 };
-    this.state = { label: label || '应用', tip: '正在启动安卓运行时…', ready: false, landscape: false };
-
-    const area = this._area();
-    const size = AppWindow.sizeFor(area, this.portrait, false);
-    const w = Math.max(320, size.w);
-    const h = Math.max(420, size.h + TITLEBAR_H);
-
-    const iconFile = iconPath && fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : undefined;
-
-    this.win = new BrowserWindow({
-      width: w,
-      height: h,
-      minWidth: 320,
-      minHeight: 420,
-      x: Math.round(area.x + (area.w - w) / 2),
-      y: Math.round(area.y + (area.h - h) / 2),
-      show: false,
-      frame: false,
-      thickFrame: true,
-      resizable: true,
-      maximizable: true,
-      backgroundColor: '#0b0c0e',
-      title: label || 'ApkStart',
-      icon: iconFile,
-      webPreferences: {
-        preload: path.join(__dirname, '..', 'preload.js'),
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: false,
-        spellcheck: false,
-        backgroundThrottling: false,
-      },
-    });
-
-    this.win.loadFile(path.join(__dirname, '..', 'ui', 'shell.html'));
-    // 页面标题会把窗口标题改成 shell.html 的 <title>，任务栏就认不出是哪个应用了，
-    // 这里挡住，让 OS 标题一直等于应用名（任务栏悬浮提示、Alt+Tab 都靠它）。
-    this.win.webContents.on('page-title-updated', (e) => {
-      e.preventDefault();
-      try { this.win.setTitle(label || 'ApkStart'); } catch (_) { /* 窗口可能已销毁 */ }
-    });
-    this.win.once('ready-to-show', () => {
-      this.win.show();
-      this._push();
-    });
-
-    // Electron 最大化时窗口尺寸会分好几步才稳定（OS 动画、DPI 重算），
-    // 单次 40ms 防抖的 fit 常常抓到中间态，结果嵌入画面只占左上角一条，
-    // 右边一大片空白 —— 就是用户截图里「最大化后没填满」。
-    // 改成连续多轮贴合收敛，每轮都按最新的 getContentBounds 重算。
-    const refit = () => this.scheduleFit(6);
-    this.win.on('resize', refit);
-    this.win.on('move', refit);
-    this.win.on('maximize', refit);
-    this.win.on('unmaximize', refit);
-    this.win.on('restore', () => {
-      this.agent.show().catch(() => {});
-      this.scheduleFit(6);
-    });
-    this.win.on('minimize', () => { this.agent.hide().catch(() => {}); });
-    this.win.on('close', () => { this._closing = true; });
-    this.win.on('closed', () => {
-      if (this._selfClose) return;   // close() 自己在 park 完成后收尾
-      this.win = null;
-      const pkg = this.pkg;
-      this.pkg = null;
-      this._closing = false;
-      // 不走 close() 的关闭路径（Alt+F4、任务栏关闭、系统关机）也必须停掉安卓应用、
-      // 把模拟器窗口摘下来。否则窗口消失了但应用还在后台跑，用户再点开会因为
-      // 「已在运行」直接切过去，看起来就是「关不掉」。
-      if (pkg && this._onCloseApp) {
-        try { this._onCloseApp(pkg); } catch (_) { /* ignore */ }
-      }
-      Promise.resolve(this.agent && this.agent.park()).catch(() => {}).then(() => {
-        if (this._closedCb) this._closedCb(pkg);
-      });
-    });
-    // 只在「应用窗口真正处于前台」且至少一项鼠标映射开启时装全局钩子；
-    // 失焦/关闭立即卸载，绝不让 ApkStart 在后台拖慢整个系统的鼠标。
-    this.win.on('focus', () => this._syncHook(true));
-    this.win.on('blur', () => this._syncHook(false));
 
     if (fullscreen) this.win.maximize();
+    this.setState({ label: label || pkg, pkg, ready: this.embedded, landscape: this.landscape });
+    this.refreshPointer();
     return this.win;
-  }
-
-  _pointerOptions() {
-    const getter = this.pointerConfig || this.mouseHook;
-    const raw = typeof getter === 'function' ? getter() : getter;
-    return hookOptions(raw);
-  }
-
-  _syncHook(active) {
-    const opts = this._pointerOptions();
-    // 游戏/低延迟模式下完全不装全局鼠标钩子：WH_MOUSE_LL 对桌面每个鼠标事件
-    // 都同步回调，会明显增加指针延迟；FPS 需要的是 Qt 窗口直接收到原始输入。
-    const game = !!(store.getSettings().engine && store.getSettings().engine.priorityMode === 'game');
-    const on = !!active && opts.enabled && !game;
-    if (this.agent && typeof this.agent.setHook === 'function') {
-      this.agent.setHook(on, opts).catch(() => {});
-    }
-  }
-
-  /** 设置页改了鼠标映射：按当前焦点重新同步一次（不重装钩子线程） */
-  refreshPointer() {
-    const focused = this.isOpen && !!this.win.isFocused();
-    if (!focused) {
-      // 窗口没在前台：只卸载，别让钩子在后台空转
-      if (this.agent && typeof this.agent.setHook === 'function') {
-        this.agent.setHook(false).catch(() => {});
-      }
-      return;
-    }
-    this._syncHook(true);
   }
 
   setState(patch) {
     this.state = { ...this.state, ...patch };
-    this._push();
-  }
-
-  _push() {
-    if (!this.isOpen) return;
-    try {
-      this.win.webContents.send('shell:state', {
-        ...this.state,
-        iconUrl: this.iconUrl || '',
-      });
-    } catch (_) { /* 窗口可能刚关闭 */ }
-  }
-
-  setIcon(p) { this.iconUrl = iconUrl(p); this._push(); }
-
-  /**
-   * 把模拟器窗口嵌进当前窗口，并铺满标题栏以下的区域。
-   * 常驻压制不关闭：它会跳过「已经嵌进我们窗口」的那一个，其余窗口（含 qemu /
-   * netsimd 的控制台黑窗）继续压住 —— 关了反而会给它们再露一次脸的机会。
-   * 模拟器窗口偶尔还没创建好（快照恢复太快的机器上），这里重试两次。
-   */
-  async embed() {
-    if (!this.isOpen) return false;
-    let last = null;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      if (!this.isOpen) return false;
-      const hwnd = this._hwnd();
-      if (!hwnd) return false;
-      // eslint-disable-next-line no-await-in-loop
-      const r = await this.agent.embed(hwnd, this._rect()).catch((e) => ({ ok: false, error: e.message }));
-      last = r;
-      if (r && r.ok) return true;
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(attempt < 2 ? 300 : 800);
+    if ('landscape' in patch) this.landscape = Boolean(patch.landscape);
+    if (this.isOpen) {
+      this.win.webContents.send('shell:state', { ...this.state, iconUrl: this.iconUrl });
     }
-    // 把失败原因带出去：上层会写进 app.log，出问题时一眼能看出是「没找到模拟器窗口」
-    // 还是「SetParent 失败」，不用再靠猜。
-    this.lastEmbedError = last ? (last.error || `emu=${last.emu}`) : 'no-response';
+  }
+
+  setIcon(iconPath) {
+    this.iconUrl = iconPath
+      ? `file:///${iconPath.replace(/\\/g, '/').replace(/ /g, '%20')}`
+      : '';
+    if (this.isOpen) {
+      this.win.webContents.send('shell:state', { ...this.state, iconUrl: this.iconUrl });
+    }
+  }
+
+  _contentDip() {
+    if (!this.isOpen) return { w: 0, h: 0 };
+    const [cw, ch] = this.win.getContentSize();
+    return { w: cw, h: Math.max(100, ch - TITLE_BAR) };
+  }
+
+  _viewportRect() {
+    if (!this.isOpen) return { x: 0, y: 0, w: 0, h: 0, clipTop: 0 };
+    const b = this.win.getBounds();
+    const sf = screen.getDisplayMatching(b).scaleFactor || 1;
+    const { w: cw, h: availH } = this._contentDip();
+    const topPx = Math.round(TITLE_BAR * sf);
+    const padPx = Math.round(PAD * sf);
+    const boxW = Math.round(cw * sf);
+    const boxH = Math.round(availH * sf);
+    return {
+      x: -padPx,
+      y: topPx - padPx,
+      w: boxW + padPx * 2,
+      h: boxH + padPx * 2,
+      clipTop: 0,
+    };
+  }
+
+  async embed({ timeoutMs = 15000 } = {}) {
+    if (!this.isOpen) { this.lastEmbedError = 'window-closed'; return false; }
+    const host = hwndInt(this.win);
+    const deadline = Date.now() + timeoutMs;
+    let lastReply = null;
+    while (Date.now() < deadline && this.isOpen) {
+      const p = await this.agent.probe();
+      lastReply = p;
+      if (p && p.emu) {
+        const v = this._viewportRect();
+        const r = await this.agent.embed(host, { x: v.x, y: v.y, w: v.w, h: v.h }, v.clipTop);
+        lastReply = r;
+        if (r && r.ok) {
+          this.embedded = true;
+          this.lastEmbedError = '';
+          this.setState({ ready: true, tip: '' });
+          this.scheduleFit(6);
+          return true;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    this.lastEmbedError = `timeout reply=${JSON.stringify(lastReply)}`;
     return false;
   }
 
-  async fitNow() {
-    if (!this.isOpen) return;
-    await this.agent.fit(this._rect()).catch(() => {});
-  }
-
-  /** 模拟器子窗口应该占据的矩形（物理像素，已把 8px 内边距推出可视区） */
-  _rect() {
-    const sf = this._scale();
-    const b = this.win.getContentBounds();
-    const top = Math.round(TITLEBAR_H * sf);
-    return {
-      x: -EMU_PAD,
-      y: top - EMU_PAD,
-      w: Math.round(b.width * sf) + EMU_PAD * 2,
-      h: Math.round((b.height - TITLEBAR_H) * sf) + EMU_PAD * 2,
-      // 上面那条 -EMU_PAD 会压到标题栏上，交给窗口代理裁掉（见 agent.fit 的 clipTop）
-      clipTop: EMU_PAD,
+  scheduleFit(burst = 1) {
+    clearTimeout(this._fitTimer);
+    if (!this.embedded || !this.isOpen) return;
+    const run = () => {
+      if (!this.embedded || !this.isOpen) return;
+      const v = this._viewportRect();
+      this.agent.fit({ x: v.x, y: v.y, w: v.w, h: v.h }, v.clipTop).catch(() => {});
     };
-  }
-
-  /**
-   * @param {number} rounds 连续贴合几轮（窗口尺寸变化时每轮都重算最新 bounds）
-   */
-  scheduleFit(rounds = 1) {
-    if (!this.isOpen) return;
-    if (this._fitTimer) clearTimeout(this._fitTimer);
-    const run = async (left) => {
-      await this.fitNow().catch(() => {});
-      if (left > 1) {
-        this._fitTimer = setTimeout(() => run(left - 1), 160);
-      } else {
-        this._fitTimer = null;
-      }
-    };
-    this._fitTimer = setTimeout(() => run(Math.max(1, rounds)), 40);
-  }
-
-  _hwnd() {
-    try {
-      const buf = this.win.getNativeWindowHandle();
-      const v = buf.length >= 8 ? buf.readBigUInt64LE(0) : BigInt(buf.readUInt32LE(0));
-      return v.toString();
-    } catch (_) {
-      return null;
+    this._fitTimer = setTimeout(run, 16);
+    if (burst > 1) {
+      const delays = [90, 220, 450, 800, 1400].slice(0, burst - 1);
+      for (const ms of delays) setTimeout(run, ms).unref?.();
     }
   }
 
-  /**
-   * 横竖屏切换（标题栏旋转按钮）= 真正把「物理面板」换成横屏或竖屏。
-   *
-   * 为什么必须这么做（踩过的坑）：
-   *   - 改 wm size：只改 Android 逻辑分辨率，模拟器的物理 LCD 仍是竖的，
-   *     Qt 把画面贴在左上角 -> 画面躺倒 90°、只占一条、四周黑边、点击坐标错位；
-   *   - 改 wm density：framebuffer 尺寸不变，画面不会铺满，最大化后右侧一大片空；
-   *   - adb emu rotate：只转画面内容，系统里还是竖屏。
-   * 唯一能得到「正立 + 铺满」横屏的办法，就是把 hw.lcd.width/height 换成
-   * 1280x720 并重启模拟器。重启约 30~60 秒，所以这里只做一次、并给出明确提示。
-   *
-   * @param {(next:boolean)=>Promise<boolean>} [onRestart] 由上层注入的重启实现
-   */
   async rotate(onRestart) {
-    if (!this.isOpen) return this.state.landscape;
-    const next = !this.state.landscape;
-    this.setState({ tip: next ? '正在切换到横屏（重启安卓运行时，约 30-60 秒）…' : '正在切回竖屏（重启安卓运行时，约 30-60 秒）…', ready: false });
-    if (typeof onRestart === 'function') {
-      const ok = await onRestart(next).catch(() => false);
-      if (ok) {
-        this.state.landscape = next;
-        this._push();
-        // 面板尺寸变了，窗口宽高比跟着换；贴合几轮收敛
-        for (let i = 0; i < 5; i += 1) {
-          // eslint-disable-next-line no-await-in-loop
-          await sleep(400);
-          // eslint-disable-next-line no-await-in-loop
-          await this.fitNow();
-        }
-        this.setState({ ready: true, tip: '' });
-        return next;
+    if (!this.isOpen || this._rotating) return;
+    this._rotating = true;
+    const next = !this.landscape;
+    this.landscape = next;
+    try {
+      if (!this.win.isMaximized()) {
+        const b = this.win.getBounds();
+        const area = screen.getDisplayMatching(b).workArea;
+        const oldW = b.width;
+        const oldH = b.height - TITLE_BAR;
+        let w = Math.min(area.width - 24, Math.max(420, oldH));
+        let h = Math.min(area.height - 24, Math.max(360, oldW) + TITLE_BAR);
+        if (next) w = Math.max(w, Math.round((h - TITLE_BAR) * 16 / 10));
+        const x = Math.max(area.x, Math.min(area.x + area.width - w, b.x + Math.round((b.width - w) / 2)));
+        const y = Math.max(area.y, Math.min(area.y + area.height - h, b.y + Math.round((b.height - h) / 2)));
+        this.win.setBounds({ x, y, width: w, height: h });
       }
+      this.setState({
+        landscape: next,
+        tip: next
+          ? 'Switching to landscape (restarting Android runtime, ~30-60s)...'
+          : 'Switching to portrait (restarting Android runtime, ~30-60s)...',
+        ready: false,
+      });
+      const restartFn = typeof onRestart === 'function' ? onRestart : this.onRestart;
+      if (typeof restartFn === 'function') {
+        await restartFn(next);
+      } else {
+        await this.setOrientation(next);
+      }
+      this.setState({ landscape: next, tip: '', ready: true });
+      this.scheduleFit(6);
+    } finally {
+      this._rotating = false;
     }
-    // 没有注入重启实现（或失败）时退回 density 方案，至少能切排版
-    if (this.setOrientation) await this.setOrientation(next).catch(() => {});
-    this.state.landscape = next;
-    this.setState({ ready: true, tip: '' });
-    return next;
   }
 
-  /** 需要时切到指定方向（全屏=横屏，窗口=竖屏） */
   async setLandscape(want) {
-    if (!this.isOpen) return this.state.landscape;
-    if (!!this.state.landscape === !!want) return this.state.landscape;
-    return this.rotate();
+    if (!this.isOpen) { this.landscape = !!want; return; }
+    if (Boolean(want) === Boolean(this.landscape)) {
+      this.scheduleFit();
+      return;
+    }
+    return this.rotate(this.onRestart);
   }
 
-  toggleMaximize() {
-    if (!this.isOpen) return;
-    if (this.win.isMaximized()) this.win.unmaximize();
-    else this.win.maximize();
-    this.scheduleFit();
-  }
-
-  minimize() { if (this.isOpen) this.win.minimize(); }
-
-  /**
-   * 关闭窗口。默认同时停掉这个安卓应用（省内存），但保留引擎，下次点开是秒开。
-   *
-   * 顺序很重要：必须先把模拟器窗口从宿主窗口上「摘下并藏好」，再销毁宿主。
-   * 反过来的话 Windows 会把跨进程的子窗口重新挂到桌面、并保持它原来的可见状态，
-   * 用户桌面上就会凭空多出一个 "Android Emulator - apkstart5554" 的黑窗。
-   */
   close({ keepApp = false } = {}) {
-    if (!this.isOpen) return;
-    const win = this.win;
-    const pkg = this.pkg;
-    this._syncHook(false);
-    if (!keepApp && pkg && this._onCloseApp) this._onCloseApp(pkg);
-    this._selfClose = true;
-    this.win = null;
-    this.pkg = null;
-    const done = () => {
-      try { win.destroy(); } catch (_) { /* ignore */ }
-      this._selfClose = false;
-      this._closing = false;
-      if (this._closedCb) this._closedCb(pkg);
-    };
-    Promise.resolve(this.agent && this.agent.park()).catch(() => {}).then(done, done);
+    if (keepApp) this._suppressCloseHook = true;
+    try { this.agent.park(); } catch (_) { /* ignore */ }
+    if (this.isOpen) this.win.close();
   }
-
-  onCloseApp(cb) { this._onCloseApp = cb; }
 }
 
-module.exports = { AppWindow, TITLEBAR_H };
+module.exports = { AppWindow, TITLE_BAR };

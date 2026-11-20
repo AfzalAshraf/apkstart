@@ -1,47 +1,45 @@
 # ApkStart v0.4.1
 
-> 一句话：定位并根治了「旋转黑边 / 应用未填满 / 点击失效 / 点不动同意」这一组症状——它们其实是**同一个原因**：嵌入的模拟器窗口和 Electron 网页层是兄弟窗口，网页层一直在最前面。
+> Fixes the related rotation black bars, incomplete app layout, and unresponsive clicks. The root cause was that the embedded emulator and Electron web layer were sibling windows, leaving the web layer in front.
 
-## 一、真正的根因
+## 1. Root cause
 
-用 `WindowFromPoint` 在画面中心做命中测试，发现返回的**不是模拟器窗口**，而是 `Chrome_RenderWidgetHostHWND`（Electron 的网页渲染层）。
+A `WindowFromPoint` hit test at the center of the app returned `Chrome_RenderWidgetHostHWND` (Electron's web renderer), not the emulator. The renderer's black background covered the Android image and consumed mouse input.
 
-也就是说：网页层那块黑底一直盖在安卓画面之上，并且把鼠标事件全吃了。于是同时出现：
-
-| 用户看到 | 实际原因 |
+| Symptom | Cause |
 |---|---|
-| 画面有黑边 / 未填满 | 网页层黑底盖住了嵌入画面，或只露出一部分 |
-| 点击失效、无法对应 | 鼠标点到了网页层，根本没进安卓 |
-| 点不动「同意并继续」 | 同上（`adb input tap` 能点，因为是逻辑坐标、绕过宿主） |
-| 旋转 / 全屏后更明显 | 改窗口尺寸触发 Chromium 重绘，又把自己抬回最前 |
+| Black bars or an incomplete image | The web layer covered the embedded image or only part of it was visible. |
+| Clicks did nothing or landed incorrectly | Clicks hit the web layer instead of Android. |
+| “Agree and continue” could not be tapped | Same cause (`adb input tap` worked because it uses Android logical coordinates). |
+| Worse after rotation or full-screen | Resizing caused Chromium to repaint and raise its web layer again. |
 
-之前 v0.3.9 我用 `SetWindowRgn` 裁剪想把标题栏那条 8px 挤出画面，反而**破坏了 Qt/GL 子窗口的命中测试**，并让 region 在 resize 后与窗口尺寸不匹配 —— 这正是这一版问题的直接来源。
+The v0.3.9 `SetWindowRgn` workaround also broke Qt/GL child-window hit testing and left a region that no longer matched the window after resizing. That was the direct source of this release's symptoms.
 
-## 二、修复
+## 2. Fixes
 
-1. **移除 `SetWindowRgn` 裁剪**，改为在 `Embed()` 时显式清掉旧版本可能残留的 region。标题栏那条溢出由宿主自绘标题栏自然盖住。
-2. **把模拟器窗口挂成网页渲染层的子窗口**（而不是宿主的兄弟子窗口）。子窗口的 Z 序与鼠标命中天然优先于父窗口，网页层再也不会盖住画面、吃掉点击。
-   - embed 那一刻网页层可能还没建好，所以在 `Fit()` 与常驻扫描里都做了补挂，保证一定生效。
-3. **收窄 `HideStrayWindows`**：只隐藏明确的弹窗类（Qt 工具窗 / 控制台），绝不碰 `QWindowIcon` / `subWin`（那是正在显示的 LCD），避免把画面误藏成全黑。
-4. **启动完成后把窗口抬到最前**（短暂 topmost 再撤销）：避免别的窗口（浏览器等）盖在上面导致「黑屏 + 点不动」。
-5. **旋转时的窗口尺寸**：
-   - 最大化状态下 `setContentSize` 无效，现在先 `unmaximize` 再改尺寸，否则横屏画面被塞进竖窗口 = 黑边 / 未填满；
-   - 目标尺寸限制在屏幕可用区内；
-   - `wm size` 变化后 Qt 会重排多次，改为连续 6 轮 `Fit` 收敛，彻底消除残留黑边。
+1. **Remove `SetWindowRgn` clipping.** Clear any region left by an older version during `Embed()`; the host-drawn title bar naturally covers the small overflow.
+2. **Parent the emulator under the web renderer** rather than making both windows children of the host. Child-window Z order and hit testing then take precedence, preventing the web layer from covering the image or consuming clicks.
+   - The renderer may not exist when `embed` first runs, so `Fit()` and the persistent scan retry parenting until it succeeds.
+3. **Narrow `HideStrayWindows`:** hide only known popup classes (Qt tool windows and consoles), never `QWindowIcon` or `subWin`, which can be the LCD currently being displayed.
+4. **Raise the app window after startup** using a brief topmost state, then remove it, so another window cannot cover the embedded image.
+5. **Fix sizing during rotation:**
+   - `setContentSize` does not work while maximized; unmaximize before resizing, then restore as needed.
+   - Constrain target dimensions to the available screen area.
+   - Qt may relayout several times after `wm size`; run six `Fit` passes to settle and remove remaining bars.
 
-## 三、实测（这次是端到端真实交互，不是 adb 模拟）
+## 3. Reported end-to-end validation
 
-- 用**真实鼠标**点击「同意并继续」→ 进入 `MainFragmentActivity` → 继续点进 `ShortSeriesActivity` 播放页；
-- `PrintWindow` 抓宿主窗口：安卓画面**铺满标题栏以下全部区域，四周无黑边、无留白**，视频 / 点赞 / 评论 / 选集 / 标题栏四按钮全部正常；
-- `WindowFromPoint` 在画面中心返回模拟器窗口（修复前返回网页层）；
-- `npm test`：**115 项全部通过**（8 + 25 + 82），新增两条回归测试钉住「嵌入窗口必须挂到网页层下且不得设 region」。
+- Use a **real mouse** to click “Agree and continue,” open `MainFragmentActivity`, then launch the `ShortSeriesActivity` playback screen.
+- `PrintWindow` capture showed the Android image filling the area below the title bar, with no bars or blank space. Video, likes, comments, episode selection, and title-bar buttons worked.
+- `WindowFromPoint` at the center returned the emulator (it returned the renderer before the fix).
+- `npm test`: **115 checks passed** (8 + 25 + 82); two regression checks ensure the emulator is parented to the renderer and no window region is set.
 
-## 四、工程加固
+## 4. Hardening
 
-- `agent.ps1` 保持 UTF-8 BOM（丢 BOM 会让 PowerShell 5.1 按 ANSI 读中文注释，`Add-Type` 编译失败 → 窗口代理启动失败）；
-- 新增回归测试：验证 `SetParent(emu, parent)` / `FindChromeRender` 存在、`CreateRectRgn(0, clipTop)` 不存在、embed 时清 region。
+- Keep the UTF-8 BOM in `agent.ps1`; without it, Windows PowerShell 5.1 may misread UTF-8 comments and cause `Add-Type` compilation to fail.
+- Add regression checks for `SetParent(emu, parent)` and `FindChromeRender`, the absence of `CreateRectRgn(0, clipTop)`, and clearing old regions during embed.
 
-## 五、升级方式
+## 5. Upgrade
 
-- 便携版：解压覆盖，数据目录（默认 `%APPDATA%\apkstart`）保持不变。
-- 安装版：直接安装覆盖。
+- Portable: extract over the existing app; keep the data directory (default `%APPDATA%\apkstart`).
+- Installer: install over the existing version.

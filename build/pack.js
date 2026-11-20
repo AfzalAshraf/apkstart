@@ -1,14 +1,14 @@
 'use strict';
 /**
- * 便携版打包：产出 dist/ApkStart-win64-portable/
- *   ApkStart.exe（即 electron.exe 改名）+ resources/app（本应用源码）
- * 无需安装器，解压即用；将来接 electron-builder 出安装包时可复用同一目录结构。
+ * Build the portable package at dist/ApkStart-win64-portable/.
+ *   ApkStart.exe (renamed from electron.exe) + resources/app (application source).
+ * No installer is required; extract and run. The same layout can be reused by electron-builder.
  */
 const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-// 允许指定输出目录（用于目标目录被正在运行的实例占用时，先构建到别处再替换）
+// Allow a custom output directory so a locked target can be replaced after building elsewhere.
 let OUT = process.env.APKSTART_PACK_OUT
   ? path.resolve(process.env.APKSTART_PACK_OUT)
   : path.join(ROOT, 'dist', 'ApkStart-win64-portable');
@@ -18,30 +18,30 @@ function copy(src, dest) {
   fs.cpSync(src, dest, { recursive: true });
 }
 
-console.log('打包便携版 →', OUT);
-// 目标已存在时不做整树删除：部分环境会拦截批量删除，且打包中途失败会丢掉
-// 上一个可用版本。改为先把旧目录改名保留，再全新构建；占用中则自动换目录。
+console.log('Building portable package →', OUT);
+// Do not recursively delete an existing target: some environments block bulk deletion, and a failed build would remove
+// the last working package. Rename it as a backup first, then build cleanly; use a versioned path if it is locked.
 if (fs.existsSync(OUT)) {
   try {
     const backup = `${OUT}.prev-${new Date().toISOString().replace(/[:.]/g, '-')}`;
     fs.renameSync(OUT, backup);
-    console.log('旧版本已保留 →', backup);
+    console.log('Previous version preserved →', backup);
   } catch (_) {
-    // 某些环境（杀软 / 搜索索引 / 资源管理器）会长时间持有目录句柄，
-    // 整目录改名必然 EBUSY；这时退到带版本号的目录，产物一样可用且不再重名。
+    // Antivirus, search indexing, or Explorer may hold the directory handle for a long time,
+    // making a directory rename fail with EBUSY. Fall back to a versioned output path to avoid collisions.
     OUT = path.join(ROOT, 'dist', `ApkStart-v${require(path.join(ROOT, 'package.json')).version}-win64-portable`);
-    console.log('旧目录被占用，改输出到 →', OUT);
+    console.log('Previous directory is locked; using →', OUT);
   }
 }
 fs.mkdirSync(path.join(OUT, 'resources', 'app'), { recursive: true });
 
-// 1. Electron 运行时
-console.log('复制 Electron 运行时…');
+// 1. Electron runtime
+console.log('Copying Electron runtime...');
 copy(ELECTRON_DIST, OUT);
 fs.rmSync(path.join(OUT, 'resources', 'default_app.asar'), { force: true });
 
-// 1.1 语言包瘦身：Electron 自带 55 种语言，合计 41MB，我们只用中文界面。
-//     只留 zh-CN / zh-TW / en-US，其余删掉（-39MB，等于整包小 15%）。
+// 1.1 Trim locale packs: Electron ships 55 locales totaling 41 MB. Keep Simplified Chinese, Traditional Chinese, and English.
+//     Retaining zh-CN, zh-TW, and en-US saves about 39 MB (roughly 15% of the package).
 const KEEP_LOCALES = new Set(['zh-CN.pak', 'zh-TW.pak', 'en-US.pak']);
 let localeSaved = 0;
 try {
@@ -51,40 +51,40 @@ try {
     localeSaved += (() => { try { return fs.statSync(path.join(locDir, f)).size; } catch (_) { return 0; } })();
     fs.rmSync(path.join(locDir, f), { force: true });
   }
-} catch (_) { /* 没有 locales 目录也不影响 */ }
+} catch (_) { /* A missing locales directory is harmless. */ }
 
-// 1.2 没人会点开的文件：更新日志、调试符号、部分无用的 pak（各自 0.1~9MB）
+// 1.2 Remove backup license data and stale SwiftShader ICD metadata that are not needed at runtime.
 for (const rel of ['LICENSES.chromium.html.bak', 'vk_swiftshader_icd.json.bak']) {
   fs.rmSync(path.join(OUT, rel), { force: true });
 }
 
-// 1.3 可省掉的运行库：
-//     d3dcompiler_47.dll 负责把 ANGLE 的 HLSL 编成 GPU 指令，但 Windows 8.1 起
-//     System32 里就自带同名 DLL，LoadLibrary 找不到包内那份会自然用系统的。
-//     实测删掉后界面/图标/字体渲染完全正常（--smoke 截图对比无差异）。压紧 2.1MB。
-//     注意：vk_swiftshader.dll / vulkan-1.dll 不能删 —— GPU 驱动不可用时 Chromium
-//     靠它做软件兜底，删了会白屏。
+// 1.3 Runtime files that can be omitted:
+//     d3dcompiler_47.dll compiles ANGLE HLSL into GPU instructions, but Windows 8.1 and later
+//     include this DLL in System32. If LoadLibrary cannot find the bundled copy, it uses the system copy.
+//     Removing it passed UI, icon, and font-rendering smoke checks (screenshots were unchanged); saves 2.1 MB.
+//     Do not remove vk_swiftshader.dll or vulkan-1.dll: Chromium uses them as a software fallback when GPU drivers
+//     are unavailable; removing them can cause a blank window.
 let pruneSaved = 0;
 for (const rel of ['d3dcompiler_47.dll']) {
   const p = path.join(OUT, rel);
   try {
     pruneSaved += fs.statSync(p).size;
     fs.rmSync(p, { force: true });
-  } catch (_) { /* 本来就没有 */ }
+  } catch (_) { /* Not present. */ }
 }
 
-// 2. 应用本体
-console.log('复制应用…');
+// 2. Application files
+console.log('Copying application files...');
 const appDir = path.join(OUT, 'resources', 'app');
 for (const item of ['package.json', 'src', 'LICENSE']) {
   const src = path.join(ROOT, item);
   if (fs.existsSync(src)) copy(src, path.join(appDir, item));
 }
 
-// 3. 可选目录
-// engine/ 下只有文档类内容随包分发；大体积运行时组件（emulator、system-images、
-// platform-tools、avd）由应用首次启动时自动从官方源下载，不进安装包。
-// tools/ 是开发期自检脚本（黑窗实测、测速），用户用不到，不再随包分发。
+// 3. Optional directories
+// Only documentation is bundled from engine/. Large runtime components (emulator, system-images,
+// platform-tools, and AVD data) are downloaded from official sources on first launch, not bundled.
+// tools/ contains developer diagnostics and benchmarks; it is not needed by users and is not bundled.
 const ENGINE_SKIP = new Set(['emulator', 'system-images', 'platform-tools', 'avd', 'aehd', '_dl', 'qemu']);
 for (const opt of ['engine']) {
   const src = path.join(ROOT, opt);
@@ -97,14 +97,14 @@ for (const opt of ['engine']) {
   }
 }
 
-// 4. 改名主程序
+// 4. Rename the main executable
 fs.renameSync(path.join(OUT, 'electron.exe'), path.join(OUT, 'ApkStart.exe'));
 
-// 5. 版本信息
+// 5. Version information
 const pkg = require(path.join(ROOT, 'package.json'));
-fs.writeFileSync(path.join(OUT, 'VERSION.txt'), `ApkStart ${pkg.version}\n构建时间：${new Date().toLocaleString('zh-CN')}\n`);
+fs.writeFileSync(path.join(OUT, 'VERSION.txt'), `ApkStart ${pkg.version}\nBuild time: ${new Date().toISOString()}\n`);
 
-// 6. 体积报告：每次打包都打印，避免以后又悄悄变胖
+// 6. Report package size on every build to catch unexpected growth.
 function dirSize(dir) {
   let n = 0;
   try {
@@ -117,8 +117,8 @@ function dirSize(dir) {
 }
 const totalMB = dirSize(OUT) / 1048576;
 console.log(
-  `完成。整包 ${totalMB.toFixed(0)} MB（语言包省了 ${(localeSaved / 1048576).toFixed(0)} MB，`
-  + `冗余运行库省了 ${(pruneSaved / 1048576).toFixed(1)} MB）。`,
+  `Done. Package: ${totalMB.toFixed(0)} MB (locale packs saved ${(localeSaved / 1048576).toFixed(0)} MB, `
+  + `redundant runtime files saved ${(pruneSaved / 1048576).toFixed(1)} MB).`,
 );
-console.log('压缩：node build/zip.js dist/ApkStart-win64-portable <输出.zip>');
-console.log(`运行 ${path.join(OUT, 'ApkStart.exe')} 即可使用。`);
+console.log('Compress with: node build/zip.js dist/ApkStart-win64-portable <output.zip>');
+console.log(`Run ${path.join(OUT, 'ApkStart.exe')} to launch the app.`);

@@ -1,16 +1,13 @@
-﻿# ApkStart window agent (ASCII only).
-# A single long-lived helper that owns every Win32 trick we need:
-#   * re-parents the Android emulator Qt window into an ApkStart BrowserWindow (one clean window,
-#     no emulator sidebar, no emulator title bar);
-#   * hides the floating emulator toolbar window that shows the volume/camera/back rail;
-#   * rotates the device with Ctrl+Left / Ctrl+Right and reports the new window size;
-#   * runs an opt-in WH_MOUSE_LL hook so right click becomes Android BACK, wheel
-#     becomes a coalesced swipe, and (optionally) side buttons become BACK / FORWARD.
-#     Left click is deliberately left alone: Qt already maps it to a finger tap.
-# Everything is P/Invoke from the .NET Framework that ships with Windows 10/11,
-# so there is no native binary to compile, sign or ship.
+﻿param([int]$Port = 0)
+# ApkStart Win32 window & input agent (UTF-8 with BOM for PowerShell 5.1 Add-Type compatibility).
+# Owns every Win32 integration required for seamless per-app windows:
+#   * Re-parents the Android Emulator Qt framebuffer into our Chromium render child window;
+#   * Suppresses stray emulator toolbars and console black windows scoped strictly by exe path;
+#   * Injects Ctrl+Left / Ctrl+Right panel rotation when our host window is foreground;
+#   * Runs a foreground-scoped WH_MOUSE_LL hook on a dedicated message-pumping thread so
+#     right-click maps to Android BACK, mouse wheel coalesces into smooth swipes, and
+#     side buttons optionally map to BACK / FORWARD.
 # Protocol: TCP on 127.0.0.1, one JSON object per line. First stdout line is "PORT=<n>".
-param([int]$Port = 0)
 
 $ErrorActionPreference = 'Stop'
 $src = @'
@@ -30,7 +27,6 @@ public class ApkAgent
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct MSLLHOOKSTRUCT { public POINT Pt; public int MouseData; public int Flags; public int Time; public IntPtr Extra; }
     [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr Hwnd; public uint Message; public IntPtr WParam; public IntPtr LParam; public uint Time; public int X; public int Y; }
-    // Minimal PROCESS_BASIC_INFORMATION: enough to read InheritedFromUniqueProcessId.
     [StructLayout(LayoutKind.Sequential)] public struct PBI { public IntPtr R1; public IntPtr Peb; public IntPtr R2a; public IntPtr R2b; public IntPtr Pid; public IntPtr ParentPid; }
 
     public delegate bool EnumProc(IntPtr h, IntPtr p);
@@ -47,7 +43,6 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
-    // 裁剪嵌入窗口的可见区域：把压到标题栏上的那条外框去掉
     [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
     [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
@@ -100,6 +95,10 @@ public class ApkAgent
     const uint SWP_NOMOVE = 0x0002;
     const uint SWP_NOSIZE = 0x0001;
 
+    // Monotonic 64-bit millisecond clock (avoids 24.8-day signed 32-bit Environment.TickCount wraparound).
+    static readonly Stopwatch _clock = Stopwatch.StartNew();
+    static long NowMs() { return _clock.ElapsedMilliseconds; }
+
     static IntPtr _host = IntPtr.Zero;
     static IntPtr _emu = IntPtr.Zero;
     static IntPtr _chromeRender = IntPtr.Zero;
@@ -110,53 +109,30 @@ public class ApkAgent
     static uint _hookTid = 0;
     static readonly ManualResetEvent _hookReady = new ManualResetEvent(false);
     static readonly ConcurrentQueue<string> _events = new ConcurrentQueue<string>();
-    static long _lastToolSweep = 0;
+    static long _lastToolSweep = -10000;
     static long _embedAt = 0;
-    // 常驻压制：默认一开机就开，把模拟器主窗 + 工具栏 + 控制台黑窗压住。
-    // 与「embed 完成就关掉」的旧逻辑不同，它是**常驻**的 —— sweep 会跳过已经嵌进
-    // 我们窗口的那一个窗口，其余一律藏起来（含 ApkStart 退出后回到桌面的那个黑窗）。
     static volatile bool _quiet = true;
     static volatile bool _perfMode = false;
-    static long _bootHideSweep = 0;
-    // 兜底超时：万一 embed 没来（用户只是打开了 ApkStart 没点应用），
-    // 不能让 120ms 一轮的扫描永远跑下去白烧 CPU。每次真藏到窗口就续期。
+    static long _bootHideSweep = -10000;
     static long _bootHideUntil = 0;
-    static long _bootHideStart = Environment.TickCount;
-    // 断线后的「守卫」截止时间（TickCount）。见 Serve() 里 sock == null 的分支。
+    static long _bootHideStart = 0;
     static long _lingerUntil = 0;
 
-    // Which windows count as "ours": only those created by a process whose exe lives
-    // inside one of these directories (the runtime root / bundled engine dir).
-    // This is the whole fix for "ApkStart conflicts with WeChat": WeChat 4.x is Qt 6
-    // too (its windows are QWindowIcon / QWindowToolSaveBits), so any matching that
-    // relied on window class names alone could hide or even re-parent WeChat's own
-    // windows. Class names are never unique; the owning process's path is.
     static readonly System.Collections.Generic.List<string> _scopeDirs = new System.Collections.Generic.List<string>();
     static readonly System.Collections.Generic.Dictionary<uint, bool> _oursCache = new System.Collections.Generic.Dictionary<uint, bool>();
-    // PID of the ApkStart main process. The only window we are ever allowed to embed
-    // into / swallow clicks for. Guard against a recycled HWND: if _host later belongs
-    // to somebody else, the mouse hook must pass events through instead of eating them.
     static uint _appPid = 0;
     static uint _hostPid = 0;
 
-    // Hook options. All three default to OFF: an "hook on" without options must
-    // never swallow anybody's clicks. JS sends the real config on every enable.
     static volatile int _optRight = 0;
     static volatile int _optWheel = 0;
     static volatile int _optSide = 0;
 
-    // Wheel coalescing: Qt would turn every single notch into a separate touch
-    // gesture (visible stutter). We accumulate deltas for a short window and
-    // hand one normalized position to the JS side, which injects a single swipe.
     static readonly object _wheelLock = new object();
     static int _wheelDx = 0, _wheelDy = 0;
     static double _wheelNx = 0.5, _wheelNy = 0.5;
     static long _wheelFirst = 0, _wheelLast = 0;
 
     // ------------------------------------------------------------------ ownership
-    // Scope is set by the JS side before anything is hidden ("scope" command).
-    // With no scope the agent refuses to touch any window: leaving one black console
-    // around is a cosmetic bug, hiding a user's WeChat window is not.
     static void SetScope(string raw)
     {
         _scopeDirs.Clear();
@@ -198,7 +174,6 @@ public class ApkAgent
         catch { ours = false; }
         lock (_oursCache)
         {
-            // PIDs get recycled; a bounded cache is enough (one entry per live process).
             if (_oursCache.Count > 400) _oursCache.Clear();
             _oursCache[pid] = ours;
         }
@@ -210,7 +185,7 @@ public class ApkAgent
         IntPtr h = IntPtr.Zero;
         try
         {
-            h = OpenProcess(0x1000, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION
+            h = OpenProcess(0x1000, false, pid);
             if (h == IntPtr.Zero) return 0;
             PBI pbi = new PBI();
             int len;
@@ -221,8 +196,6 @@ public class ApkAgent
         finally { if (h != IntPtr.Zero) CloseHandle(h); }
     }
 
-    // Console windows belong to conhost.exe, not to the program that owns the console,
-    // so the window pid is never the emulator's. Walk conhost's parents instead.
     static bool ConsoleOwnedByUs(uint pid)
     {
         uint p = ParentOf(pid);
@@ -240,8 +213,6 @@ public class ApkAgent
         GetWindowThreadProcessId(h, out pid);
         if (IsOurs(pid) || ConsoleOwnedByUs(pid)) return true;
         if (_scopeDirs.Count == 0) return false;
-        // Windows titles a console with the image path it launched, so the runtime
-        // directory shows up verbatim. Precise enough to never match a stray terminal.
         string title = TitleOf(h).ToLowerInvariant();
         for (int i = 0; i < _scopeDirs.Count; i++)
             if (title.IndexOf(_scopeDirs[i], StringComparison.Ordinal) >= 0) return true;
@@ -262,23 +233,12 @@ public class ApkAgent
         return sb.ToString();
     }
 
-    // The emulator draws its framebuffer in a "QWindowIcon" top level window titled
-    // "Android Emulator - <avd>:<port>"; the volume/rotate rail lives in a separate
-    // small "QWindowTool*" window we hide.
-    //
-    // 注意：模拟器开机阶段（以及被常驻压制藏起来之后）这个窗口是**不可见**的，
-    // 所以这里不能再按 IsWindowVisible 过滤 —— 否则永远找不到可嵌入的窗口，
-    // 用户看到的是一个全黑的应用窗口。改为「标题是 Android Emulator 就认，
-    // 可见的大窗口优先」。工具栏 / 提示窗（QWindowTool）尺寸太小，被面积阈值挡掉。
     static IntPtr FindEmulator()
     {
         IntPtr best = IntPtr.Zero;
         long bestScore = long.MinValue;
         EnumWindows(delegate(IntPtr h, IntPtr p)
         {
-            // Ownership comes first. "QWindowIcon" is the class of EVERY Qt top level
-            // window, and WeChat 4.x / MuMu / music players are Qt too -- matching on
-            // the class alone is how the wrong window ended up hidden or re-parented.
             uint owner;
             GetWindowThreadProcessId(h, out owner);
             if (!IsOurs(owner)) return true;
@@ -290,8 +250,7 @@ public class ApkAgent
             RECT r;
             if (!GetWindowRect(h, out r)) return true;
             long area = (long)(r.R - r.L) * (r.B - r.T);
-            if (area < 200 * 200) return true;   // 工具栏 / 提示窗不是画面窗口
-            // 可见的大窗口优先，其次才是隐藏的
+            if (area < 200 * 200) return true;
             long score = area + (IsWindowVisible(h) ? 1000000000L : 0);
             if (score > bestScore) { bestScore = score; best = h; }
             return true;
@@ -299,8 +258,6 @@ public class ApkAgent
         return best;
     }
 
-    // 诊断用：列出顶层窗口（类别 / 标题 / pid / 尺寸 / 是否可见）。
-    // 用于验证「打开软件只看到软件界面」——模拟器主窗、netsim 控制台都必须不在其中。
     static string ListWindows(bool includeHidden)
     {
         var sb = new StringBuilder();
@@ -310,7 +267,6 @@ public class ApkAgent
             if (!vis && !includeHidden) return true;
             string cls = ClassOf(h);
             string title = TitleOf(h);
-            // 隐藏窗口太多（系统里有成百上千个），只看跟模拟器/Qt 有关的
             if (!vis && cls.IndexOf("QWindow", StringComparison.Ordinal) < 0
                 && title.IndexOf("Android Emulator", StringComparison.OrdinalIgnoreCase) < 0) return true;
             RECT r;
@@ -339,31 +295,20 @@ public class ApkAgent
             if (!IsWindowVisible(h)) return true;
             string cls = ClassOf(h);
             if (cls.IndexOf("QWindowTool", StringComparison.Ordinal) < 0) return true;
-            // QWindowToolSaveBits is what Qt uses for menus, tooltips and popup panels --
-            // WeChat's emoji panel / right-click menu included. Only hide our own.
             uint owner;
             GetWindowThreadProcessId(h, out owner);
             if (!IsOurs(owner)) return true;
             RECT r;
             if (!GetWindowRect(h, out r)) return true;
-            if ((r.R - r.L) > 200) return true;   // the framebuffer window also uses this class
+            if ((r.R - r.L) > 200) return true;
             ShowWindow(h, 0);
             return true;
         }, IntPtr.Zero);
     }
 
-    // 开机阶段：把 qemu / emulator 的黑色控制台窗口藏起来，避免「命令窗口」闪现。
-    // 它们是 console 子系统进程，Node 的 windowsHide 覆盖不到子进程，只能靠 Win32 周期压住。
-    //
-    // 关键坑：Windows 10 以后控制台窗口真正属于 conhost.exe，GetWindowThreadProcessId
-    // 拿到的是 conhost 的 pid，不是 emulator 的 pid —— 老实现按 pid 白名单匹配，
-    // 于是这些黑窗一个都藏不住（"点了没反应，先弹个 cmd 黑框"就是这么来的）。
-    // 现在改成「pid 命中 或 窗口标题命中（标题就是被启动的 exe 路径）」，两条路任一生效即隐藏。
     static void HideConsoleWindows()
     {
-        if (_scopeDirs.Count == 0) return;   // no scope: never touch anybody's terminal
-
-        // 先扫一遍有哪些控制台窗口；一个都没有就别去枚举进程（GetProcessesByName 不便宜）
+        if (_scopeDirs.Count == 0) return;
         var consoles = new System.Collections.Generic.List<IntPtr>();
         EnumWindows(delegate(IntPtr h, IntPtr p)
         {
@@ -376,18 +321,12 @@ public class ApkAgent
         }, IntPtr.Zero);
         if (consoles.Count == 0) return;
 
-        // 老实现还有一条「标题里含 emulator / qemu / netsim 就算我们的」，
-        // 那会把用户自己开的终端（标题是某个路径，比如 D://Android//emulator）也一起藏掉。
-        // 现在只认两种证据：conhost 的父进程链能走到我们运行时目录里，
-        // 或者标题里出现我们运行时目录的绝对路径（Windows 会把镜像路径当控制台标题）。
         foreach (IntPtr h in consoles)
         {
             if (IsOurConsole(h)) ShowWindow(h, 0);
         }
     }
 
-    // 诊断用：列出当前「可见」的控制台窗口（黑窗）及其归属，供 tools 里的验证脚本使用。
-    // ours=true 表示这就是 emulator/qemu 的控制台窗口。
     static string ListConsoles()
     {
         var sb = new StringBuilder();
@@ -425,11 +364,6 @@ public class ApkAgent
         return b.ToString();
     }
 
-    // 兜底：把「我们的运行时进程」创建的任何**多余的顶层可见窗口**都藏起来。
-    // 除了模拟器主窗口（要嵌进宿主）之外，emulator / qemu / netsimd / adb 都可能
-    // 弹出一些一闪而过的东西（Qt 提示框、崩溃对话框、音量条、日志窗…）。
-    // 以前只按类名逐个点名，漏一个就闪一次；这里改成按「进程属于我们的运行时目录」
-    // 判断，覆盖面更全。宿主窗口和模拟器窗口本身不在这个范围，绝不会误伤。
     static void HideStrayWindows()
     {
         if (_scopeDirs.Count == 0) return;
@@ -442,8 +376,6 @@ public class ApkAgent
             GetWindowThreadProcessId(h, out pid);
             if (!IsOurs(pid)) return true;
             string cls = ClassOf(h);
-            // 只藏明确的弹窗类：Qt 提示窗 / 对话框 / 控制台。
-            // 绝不碰 QWindowIcon / subWin —— 那是正在嵌入的 LCD，藏掉就全黑且点击失效。
             bool safe = cls.IndexOf("QWindowTool", StringComparison.Ordinal) >= 0
                      || cls.IndexOf("ConsoleWindowClass", StringComparison.Ordinal) >= 0
                      || cls.IndexOf("CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.Ordinal) >= 0
@@ -457,14 +389,6 @@ public class ApkAgent
         }, IntPtr.Zero);
     }
 
-    // 常驻压制扫描：只要模拟器窗口还不是「我们某个窗口的子窗口」，就把它藏起来。
-    // 这样无论模拟器是在开机、预热，还是 ApkStart 已经退出（窗口被系统重新挂到桌面，
-    // 恢复成顶层窗口），用户都不会看到那个叫 "Android Emulator - apkstart5554" 的黑窗。
-    // 同时把工具栏（QWindowTool）与所有控制台窗口（qemu / netsimd / emulator）压住。
-
-    // embed 那一刻 Electron 的网页渲染子窗口可能还没建好，FindChromeRender 会返回 0，
-    // 于是 simulator 被挂成了宿主的直接子窗口（和网页层是兄弟）—— 网页层会持续
-    // 盖住画面并吃掉鼠标。这里在常驻扫描里补挂：一旦发现网页层出现了，就重挂一次。
     static void EnsureReparent()
     {
         if (_emu == IntPtr.Zero || _host == IntPtr.Zero) return;
@@ -473,13 +397,12 @@ public class ApkAgent
         if (_chromeRender == IntPtr.Zero) return;
         IntPtr ep = GetParent(_emu);
         if (ep == _chromeRender) return;
-        if (ep != _host && ep != IntPtr.Zero) return;   // 别的宿主，别乱动
+        if (ep != _host && ep != IntPtr.Zero) return;
         RECT r;
         if (!GetWindowRect(_emu, out r)) return;
         RECT hr;
         if (!GetWindowRect(_host, out hr)) return;
         SetParent(_emu, _chromeRender);
-        // 坐标相对网页层客户区（与宿主客户区一致），保持原屏幕位置
         SetWindowPos(_emu, IntPtr.Zero, r.L - hr.L, r.T - hr.T,
                      r.R - r.L, r.B - r.T, 0x0004 | 0x0010 | 0x0040);
     }
@@ -487,9 +410,6 @@ public class ApkAgent
     static void QuietSweep()
     {
         EnsureReparent();
-        // 尺寸自愈：宿主被最大化/缩放后，Electron 的 chrome 层常常没跟着变大，
-        // 画面就只剩左上角一条。这里每轮重贴一次（Fit 内部按宿主客户区重算，
-        // 尺寸没变时 SetWindowPos 基本无开销）。
         if (_emu != IntPtr.Zero && _host != IntPtr.Zero) Fit(-8, 30, 640, 480, false, 0);
         IntPtr ep = _emu != IntPtr.Zero ? GetParent(_emu) : IntPtr.Zero;
         bool embedded = _emu != IntPtr.Zero && ep != IntPtr.Zero
@@ -499,11 +419,9 @@ public class ApkAgent
         HideToolWindows();
         HideConsoleWindows();
         HideStrayWindows();
-        if (!embedded && e != IntPtr.Zero) _bootHideUntil = Environment.TickCount + 5000;
+        if (!embedded && e != IntPtr.Zero) _bootHideUntil = NowMs() + 5000;
     }
 
-    // Only our own runtime counts. The old version returned true for ANY process named
-    // "emulator" -- other emulators (MuMu / LDPlayer ship their own) kept the guard alive.
     static bool AnyEmulatorProcess()
     {
         if (_scopeDirs.Count == 0) return false;
@@ -522,13 +440,6 @@ public class ApkAgent
     }
 
     // ------------------------------------------------------------------ embed / detach
-
-    // 找宿主窗口里的 Chromium 渲染子窗口。
-    // Electron 的网页层（Chrome_RenderWidgetHostHWND）和模拟器窗口如果都是宿主的
-    // 直接子窗口，它们就是「兄弟」，而 Electron 会持续把网页层抬到最前 ——
-    // 于是网页层那块黑底盖住安卓画面、鼠标也全被它吃掉（用户看到的「黑边 /
-    // 未填满 / 点击失效 / 点不动同意」全是这个）。
-    // 把模拟器挂成网页层的**子窗口**后，Z 序与鼠标命中天然优先给模拟器。
     static IntPtr FindChromeRender(IntPtr host)
     {
         IntPtr found = IntPtr.Zero;
@@ -548,9 +459,8 @@ public class ApkAgent
     {
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
         HideToolWindows();
-        // 网页层子窗口铺满宿主客户区，坐标系与宿主一致，所以后面 Fit 传的矩形不用改。
         IntPtr parent = FindChromeRender(host);
-        if (parent == IntPtr.Zero) parent = host;   // 找不到就退回老行为，别让应用开不起来
+        if (parent == IntPtr.Zero) parent = host;
         SetParent(emu, parent);
         uint style = (uint)GetWindowLong(emu, GWL_STYLE);
         style &= ~WS_POPUP;
@@ -560,19 +470,14 @@ public class ApkAgent
         int ex = GetWindowLong(emu, GWL_EXSTYLE);
         ex &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
         SetWindowLong(emu, GWL_EXSTYLE, ex);
-        // 旧版本给这个窗口设过 window region；复用时先清掉，否则命中测试继续错位
         SetWindowRgn(emu, IntPtr.Zero, false);
         return true;
     }
 
-    // HWND_TOP: Chromium 的渲染子窗口和模拟器是同级的子窗口，
-    // 不主动抬到最前就会被 Chromium 那块黑底盖住（用户看到的就是黑屏）。
     static readonly IntPtr HWND_TOP = new IntPtr(1);
     static void Fit(int x, int y, int w, int h, bool frame, int clipTop)
     {
         if (_emu == IntPtr.Zero) return;
-        // Fit 是 JS 侧每次 resize 都会调的，此时网页层一定已经建好了。
-        // 确保模拟器挂在网页层之下（兄弟关系会被网页层盖住并吃掉鼠标）。
         if (_host != IntPtr.Zero)
         {
             IntPtr cr = FindChromeRender(_host);
@@ -583,18 +488,9 @@ public class ApkAgent
                 if (cur != cr && (cur == _host || cur == IntPtr.Zero))
                 {
                     SetParent(_emu, cr);
-                    // 坐标相对网页层客户区，与宿主一致，沿用传入的 x/y 即可
                 }
             }
         }
-        // 以 **宿主窗口客户区** 为准自校正尺寸，而不是信 JS 传来的 w/h、
-        // 也不是信 Chrome 渲染层自己的尺寸。
-        //
-        // 为什么：Electron 最大化后宿主窗口变成 1936x1048，但内部的
-        // Chrome_RenderWidgetHostHWND 仍停在旧尺寸（实测 532x984）—— 而模拟器
-        // 窗口挂在 chrome 层之下，会被父窗口裁剪，于是画面只占左上角一条、
-        // 右边一大片空白（用户截图里「最大化/全屏后没填满」）。
-        // 所以这里先把 chrome 层拉满宿主客户区，再把 emu 设为该客户区大小。
         if (_host != IntPtr.Zero)
         {
             RECT hc;
@@ -616,8 +512,6 @@ public class ApkAgent
                             }
                         }
                     }
-                    // x/y 保持 -8 的溢出（把 Qt 的 8px 灰边推出可视区），
-                    // 宽高按客户区 + 2*8；标题栏 38px 由宿主自绘盖住。
                     x = -8;
                     y = 38 - 8;
                     w = cw + 16;
@@ -627,9 +521,6 @@ public class ApkAgent
         }
         if (w < 16) w = 16;
         if (h < 16) h = 16;
-        // 只有「确实已经嵌进我们窗口」的才允许显示。
-        // 万一 embed 失败（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当独立窗口
-        // 顶到桌面上 —— 那正是用户看到的那个 "Android Emulator - apkstart5554" 黑窗。
         IntPtr ep = GetParent(_emu);
         bool embedded = ep != IntPtr.Zero
                      && (ep == _host || ep == _chromeRender);
@@ -638,14 +529,8 @@ public class ApkAgent
             ShowWindow(_emu, 0);
             return;
         }
-        // SWP_FRAMECHANGED forces Windows to recompute the whole non-client area and
-        // repaint it. It is needed exactly once (right after SetParent); repeating it
-        // on every periodic sweep caused visible stutter and wasted GPU/CPU.
         uint flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (frame ? SWP_FRAMECHANGED : 0u);
         SetWindowPos(_emu, HWND_TOP, x, y, w, h, flags);
-        // 绝不给嵌入窗口设 window region：Qt/GL 子窗口一旦带 region，命中测试和
-        // 输入坐标映射会错位（点击失效 / 点不到按钮），旋转改尺寸后 region 还是旧
-        // 矩形又会在四周露黑边。标题栏那条 8px 溢出改由宿主自绘标题栏盖住。
     }
 
     static void Raise()
@@ -669,9 +554,6 @@ public class ApkAgent
         _emu = IntPtr.Zero;
     }
 
-    // 与 Detach 相同，但**不显示**窗口：宿主窗口即将销毁时调用。
-    // 不先摘下来，Windows 会在宿主销毁时把子窗口重新挂到桌面并设成可见，
-    // 于是就凭空多出一个 "Android Emulator - apkstart5554" 的黑窗。
     static void ParkEmulator()
     {
         if (_emu == IntPtr.Zero) _emu = FindEmulator();
@@ -692,19 +574,10 @@ public class ApkAgent
     }
 
     // ------------------------------------------------------------------ rotation
-    // 模拟器的转屏是「改面板方向」，只有它自己的 Qt 快捷键 Ctrl+←/→ 会触发；
-    // 控制台命令 adb emu rotate 只是把画面转 90°，系统里仍然是竖屏（画面横躺）。
-    // 难点是快捷键必须由模拟器窗口收到键盘消息，而它已经是我们窗口的子窗口、
-    // 焦点在网页层。所以先把两个线程的输入队列接起来，把焦点临时给模拟器，
-    // 按完键再还回去。
     static void Rotate(string dir)
     {
         if (_emu == IntPtr.Zero) _emu = FindEmulator();
         if (_emu == IntPtr.Zero) return;
-        // keybd_event feeds the SYSTEM input queue, so if we are not the foreground
-        // window the Ctrl+Left lands in whatever the user is typing in (WeChat's input
-        // box, a browser, ...). Rotate is a user action in our own window; if we are
-        // not foreground, do nothing instead of typing into someone else's app.
         IntPtr fg = GetForegroundWindow();
         if (_host == IntPtr.Zero || (fg != IntPtr.Zero && GetAncestor(fg, 2) != _host)) return;
         IntPtr host = _host != IntPtr.Zero ? _host : GetParent(_emu);
@@ -747,30 +620,19 @@ public class ApkAgent
     const int WM_XBUTTONUP = 0x020C;
     const int WM_MOUSEHWHEEL = 0x020E;
 
-    static readonly Stopwatch _clock = Stopwatch.StartNew();
-    static long NowMs() { return _clock.ElapsedMilliseconds; }
-
-    // Only react inside the embedded LCD while OUR window is the foreground root.
-    // GetAncestor(GA_ROOT) covers Chromium child windows and the Qt framebuffer.
     static bool InOurLcd(POINT pt, out RECT r)
     {
         r = new RECT();
         IntPtr fg = GetForegroundWindow();
         if (fg == IntPtr.Zero || _host == IntPtr.Zero) return false;
-        // HWNDs get recycled. If "our" host is gone (or now belongs to another process)
-        // the hook must not swallow anything -- otherwise right click / wheel silently
-        // stop working in whichever app inherited the handle.
         if (!IsWindow(_host)) return false;
         if (_appPid != 0 && _hostPid != 0 && _hostPid != _appPid) return false;
         if (GetAncestor(fg, 2) != _host) return false;   // 2 = GA_ROOT
         IntPtr e = _emu;
         if (e != IntPtr.Zero && GetWindowRect(e, out r))
         {
-            // Qt keeps an 8px grey pad around the real LCD; embed() pushes it out.
             return pt.X >= r.L + 8 && pt.X <= r.R - 8 && pt.Y >= r.T + 8 && pt.Y <= r.B - 8;
         }
-        // Before embed (or if FindEmulator failed) fall back to the host window
-        // minus its 38px title bar. Approximate on HiDPI, but only a fallback.
         if (!GetWindowRect(_host, out r)) return false;
         return pt.X >= r.L + 4 && pt.X <= r.R - 4 && pt.Y >= r.T + 40 && pt.Y <= r.B - 4;
     }
@@ -796,8 +658,6 @@ public class ApkAgent
         }
     }
 
-    // Drained from the socket loop. Emit after 60ms of quiet, but never let a
-    // continuous spin starve the queue (hard cap 90ms from the first notch).
     static void FlushWheel(bool force)
     {
         int dx = 0, dy = 0;
@@ -819,9 +679,6 @@ public class ApkAgent
         lock (_wheelLock) { _wheelDx = 0; _wheelDy = 0; }
     }
 
-    // The callback must stay microscopic: Windows synchronously waits for it on
-    // EVERY mouse event of EVERY process. Anything not one of our 7 messages
-    // (including all left-button events) is a single CallNextHookEx.
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0)
@@ -840,7 +697,6 @@ public class ApkAgent
 
             if (right)
             {
-                // Qt maps a right click to a plain finger tap: swallow it, emit BACK.
                 if (msg == WM_RBUTTONDOWN) _events.Enqueue("{\"ev\":\"back\"}");
                 return (IntPtr)1;
             }
@@ -861,12 +717,6 @@ public class ApkAgent
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 
-    // A WH_MOUSE_LL hook is global: Windows synchronously waits for this callback on
-    // EVERY mouse event of EVERY application. It must therefore live on a thread whose
-    // only job is pumping messages. Installing it on the socket-serving thread (which
-    // used to block up to 4s in Poll) made the whole desktop pointer lag and drift.
-    // It is scoped now: JS installs it only while an app window is foreground, and
-    // the callback ignores events outside the embedded LCD.
     static void HookThreadProc()
     {
         _hookTid = GetCurrentThreadId();
@@ -891,8 +741,6 @@ public class ApkAgent
         _hookThread = new Thread(HookThreadProc);
         _hookThread.IsBackground = true;
         _hookThread.Start();
-        // Reply must reflect the real hook state; otherwise the JS side sees
-        // hooked:false and thinks enabling failed.
         _hookReady.WaitOne(1000);
     }
     static void HookOff()
@@ -901,10 +749,8 @@ public class ApkAgent
         _optRight = 0; _optWheel = 0; _optSide = 0;
         ResetWheel();
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
-        if (_hookTid != 0) PostThreadMessage(_hookTid, 0x0012, IntPtr.Zero, IntPtr.Zero); // WM_QUIT
+        if (_hookTid != 0) PostThreadMessage(_hookTid, 0x0012, IntPtr.Zero, IntPtr.Zero);
         _hookThread = null;
-        // _hookProc 故意保留引用：钩子线程可能正在执行回调，提前置 null
-        // 会让委托被 GC 回收。线程退出时会自然释放。
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -935,12 +781,51 @@ public class ApkAgent
 
     static string S(string line, string key)
     {
-        string pat = "\"" + key + "\":\"";
+        string pat = "\"" + key + "\"";
         int i = line.IndexOf(pat, StringComparison.Ordinal);
         if (i < 0) return "";
-        i += pat.Length;
-        int j = line.IndexOf('"', i);
-        return j < 0 ? "" : line.Substring(i, j - i);
+        i = line.IndexOf(':', i + pat.Length);
+        if (i < 0) return "";
+        i++;
+        while (i < line.Length && line[i] == ' ') i++;
+        if (i >= line.Length || line[i] != '"') return "";
+        i++;
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length)
+        {
+            char c = line[i++];
+            if (c == '"') break;
+            if (c == '\\' && i < line.Length)
+            {
+                char esc = line[i++];
+                switch (esc)
+                {
+                    case '"': sb.Append('"'); break;
+                    case '\\': sb.Append('\\'); break;
+                    case '/': sb.Append('/'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'u':
+                        if (i + 4 <= line.Length)
+                        {
+                            int code;
+                            if (int.TryParse(line.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out code))
+                            {
+                                sb.Append((char)code);
+                                i += 4;
+                            }
+                        }
+                        break;
+                    default: sb.Append(esc); break;
+                }
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
     }
 
     static void Reply(Socket s, string json)
@@ -975,12 +860,9 @@ public class ApkAgent
 
             string ev;
             while (_events.TryDequeue(out ev))
-                Reply(sock, "{\"ev\":\"" + ev + "\"}");
+                Reply(sock, ev.StartsWith("{", StringComparison.Ordinal) ? ev : "{\"ev\":\"" + ev + "\"}");
 
-            // The Qt tool rail can re-appear right after embedding. Sweep only for the
-            // first few seconds after an embed, then stop: a permanent 2s EnumWindows +
-            // SetWindowPos loop is pure overhead and competes with the foreground app.
-            long now = Environment.TickCount;
+            long now = NowMs();
             if (_embedAt != 0 && now - _embedAt < 8000 && now - _lastToolSweep > 1500)
             {
                 _lastToolSweep = now;
@@ -989,11 +871,6 @@ public class ApkAgent
             }
             if (_embedAt != 0 && now - _embedAt >= 8000) _embedAt = 0;
 
-            // 常驻压制：模拟器主窗 / 工具栏 / qemu·netsimd 控制台黑窗。
-            // 每轮要枚举全桌面窗口若干次，开销不小 —— 之前 120ms 一轮持续 90 秒，
-            // 会明显拖慢整机（用户反馈「整个系统卡顿」）。实际上窗口已经嵌入后
-            // 根本不需要这么频繁：开机前 10 秒 250ms 抓闪窗，之后 1500ms 兜底即可。
-            // game 模式（_perfMode）下进一步降到 3000ms，把 CPU 全留给安卓渲染。
             long sweepGap;
             if (_perfMode) sweepGap = (now - _bootHideStart < 10000) ? 300 : 3000;
             else sweepGap = (now - _bootHideStart < 10000) ? 250 : 1500;
@@ -1005,27 +882,21 @@ public class ApkAgent
 
             try
             {
-                // 连接已经断了（ApkStart 退出 / 异常崩溃）：不立刻收工。
-                // 模拟器可能还在开机，几十秒后 Qt 才把窗口显示出来 —— 那时如果
-                // 已经没有代理在盯着，桌面上就会留一个 Android Emulator 黑窗。
-                // 所以断线后继续「守」一会儿，直到最后一段时间没有模拟器进程。
                 if (sock == null)
                 {
-                    if (Environment.TickCount > _lingerUntil) break;
-                    // 模拟器都退干净了就不用再守
+                    if (NowMs() > _lingerUntil) break;
                     if (!AnyEmulatorProcess() && FindEmulator() == IntPtr.Zero) break;
                     Thread.Sleep(120);
                     continue;
                 }
-                // Short poll: keep the message pump responsive even when no command
-                // arrives. Never block for seconds while owning window hooks.
+                // Socket.Poll takes MICROSECONDS (15000 us = 15 ms, ~66 Hz responsive message pump without CPU spin).
                 if (!sock.Poll(50, SelectMode.SelectRead)) continue;
                 int n = sock.Receive(buf);
                 if (n <= 0)
                 {
                     try { sock.Close(); } catch { }
                     sock = null;
-                    if (_quiet) { _lingerUntil = Environment.TickCount + 180000; continue; }
+                    if (_quiet) { _lingerUntil = NowMs() + 180000; continue; }
                     break;
                 }
                 rx.Append(Encoding.UTF8.GetString(buf, 0, n));
@@ -1041,8 +912,6 @@ public class ApkAgent
                     string cmd = S(line, "cmd");
                     if (cmd == "scope")
                     {
-                        // Whitelist of "our" directories. Must arrive before boothide /
-                        // embed; the sweeps refuse to touch anything outside it.
                         SetScope(S(line, "dirs"));
                         long appPid = L(line, "pid");
                         _appPid = appPid > 0 ? (uint)appPid : 0;
@@ -1051,15 +920,9 @@ public class ApkAgent
                     }
                     else if (cmd == "embed")
                     {
-                        // 嵌入即代表「用户要看画面了」。压制不关（它只藏非嵌入窗口
-                        // 与控制台黑窗），但要先把窗口从隐藏状态正确地交给 SetParent，
-                        // 再由 Fit 的 SWP_SHOWWINDOW 显示出来。
                         IntPtr want = new IntPtr(L(line, "host"));
                         uint wantPid = 0;
                         if (want != IntPtr.Zero) GetWindowThreadProcessId(want, out wantPid);
-                        // Never re-parent into a foreign window: a stale handle could
-                        // point at another app (the exact way "ApkStart ate WeChat's
-                        // window" can happen).
                         if (want == IntPtr.Zero || (_appPid != 0 && wantPid != _appPid))
                         {
                             Reply(sock, "{\"ok\":false,\"error\":\"host-not-ours\"}");
@@ -1072,8 +935,8 @@ public class ApkAgent
                             _chromeRender = FindChromeRender(want);
                             _emu = FindEmulator();
                             bool ok = Embed(_host, _emu);
-                            _embedAt = Environment.TickCount;
-                            _lastToolSweep = 0;
+                            _embedAt = NowMs();
+                            _lastToolSweep = -10000;
                             Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), true, (int)L(line, "clipTop"));
                             Reply(sock, "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64() + "}");
                         }
@@ -1097,7 +960,6 @@ public class ApkAgent
                     }
                     else if (cmd == "perf")
                     {
-                        // JS 侧根据 priorityMode 通知：game 模式下降频窗口扫描
                         _perfMode = L(line, "on") != 0;
                         Reply(sock, "{\"ok\":true}");
                     }
@@ -1113,8 +975,6 @@ public class ApkAgent
                     }
                     else if (cmd == "hook")
                     {
-                        // Options are re-sent on every enable, so changing settings
-                        // while the hook is live needs no reinstall / no thread churn.
                         _optRight = L(line, "right") == 1 ? 1 : 0;
                         _optWheel = L(line, "wheel") == 1 ? 1 : 0;
                         _optSide = L(line, "side") == 1 ? 1 : 0;
@@ -1141,14 +1001,12 @@ public class ApkAgent
                         if (L(line, "on") == 1)
                         {
                             _quiet = true;
-                            _bootHideSweep = 0;
-                            _bootHideStart = Environment.TickCount;
+                            _bootHideSweep = -10000;
+                            _bootHideStart = NowMs();
                             QuietSweep();
                         }
                         else
                         {
-                            // 保留窗口不动，只把控制台黑窗再压一遍（关掉 quiet 一般是因为
-                            // 用户想自己看一眼模拟器窗口，见设置 startVisible）。
                             _quiet = false;
                             HideConsoleWindows();
                         }
@@ -1156,12 +1014,9 @@ public class ApkAgent
                     }
                     else if (cmd == "park")
                     {
-                        // 应用窗口要关了：先把模拟器窗口从宿主上摘下来并藏好，
-                        // 避免宿主销毁时 Windows 把它重新挂到桌面、恢复成顶层可见窗口
-                        // （用户看到的「凭空冒出一个 Android Emulator 黑窗」就是这么来的）。
                         _quiet = true;
-                        _bootHideStart = Environment.TickCount;
-                        _bootHideSweep = 0;
+                        _bootHideStart = NowMs();
+                        _bootHideSweep = -10000;
                         ParkEmulator();
                         Reply(sock, "{\"ok\":true}");
                     }
@@ -1181,7 +1036,7 @@ public class ApkAgent
             {
                 try { sock.Close(); } catch { }
                 sock = null;
-                if (_quiet) { _lingerUntil = Environment.TickCount + 180000; continue; }
+                if (_quiet) { _lingerUntil = NowMs() + 180000; continue; }
                 break;
             }
             catch (Exception) { }

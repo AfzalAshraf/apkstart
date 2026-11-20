@@ -1,42 +1,41 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
-<title>ApkStart</title>
-<link rel="stylesheet" href="shell.css" />
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: file:; style-src 'self' 'unsafe-inline'; img-src 'self' data: file:;" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ApkStart</title>
+  <link rel="stylesheet" href="shell.css" />
 </head>
 <body>
-<header class="bar" id="bar">
-  <img class="ico" id="appIcon" alt="" draggable="false" />
-  <span class="name" id="appName">应用</span>
-  <span class="grow"></span>
-  <button class="ctl" id="btnRotate" title="横屏 / 竖屏（Ctrl+R）">
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M4 8V6a2 2 0 0 1 2-2h8"/><path d="M17.5 1.5 21 5l-3.5 3.5"/>
-      <path d="M20 16v2a2 2 0 0 1-2 2H10"/><path d="M6.5 22.5 3 19l3.5-3.5"/>
-    </svg>
-  </button>
-  <button class="ctl" id="btnMin" title="最小化">
-    <svg viewBox="0 0 12 12" width="11" height="11"><rect x="2" y="5.4" width="8" height="1.2" fill="currentColor"/></svg>
-  </button>
-  <button class="ctl" id="btnMax" title="最大化">
-    <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.1"><rect x="2.2" y="2.2" width="7.6" height="7.6"/></svg>
-  </button>
-  <button class="ctl close" id="btnClose" title="关闭">
-    <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2.4 2.4 9.6 9.6M9.6 2.4 2.4 9.6"/></svg>
-  </button>
-</header>
-
-<main class="stage" id="stage">
-  <div class="boot" id="boot">
-    <img class="boot-ico" id="bootIcon" alt="" draggable="false" />
-    <div class="boot-name" id="bootName"></div>
-    <div class="boot-bar"><i></i></div>
-    <div class="boot-tip" id="bootTip">正在启动安卓运行时…</div>
-  </div>
-</main>
-
-<script src="shell.js"></script>
+  <header class="bar" id="bar">
+    <img class="ico" id="appIcon" alt="" draggable="false" />
+    <span class="name" id="title">ApkStart</span>
+    <span class="grow"></span>
+    <div class="controls">
+      <button class="ctl rotate" id="btnRotate" title="Toggle portrait or landscape (Ctrl+R)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M19 8l3 3-3 3"/></svg>
+        <span id="orientText">Landscape</span>
+      </button>
+      <button class="ctl" id="btnMin" title="Minimize" aria-label="Minimize">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+      <button class="ctl" id="btnMax" title="Maximize or restore" aria-label="Maximize or restore">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+      </button>
+      <button class="ctl close" id="btnClose" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+      </button>
+    </div>
+  </header>
+  <main class="stage" id="stage">
+    <div class="boot" id="boot" role="status" aria-live="polite">
+      <img class="boot-ico" id="bootIcon" alt="" draggable="false" />
+      <div class="boot-name" id="bootName">ApkStart</div>
+      <div class="boot-bar"><i></i></div>
+      <div class="boot-tip" id="tip">Starting the Android app...</div>
+    </div>
+  </main>
+  <script src="shell.js"></script>
 </body>
 </html>

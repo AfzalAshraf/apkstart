@@ -1,186 +1,254 @@
 'use strict';
 /**
- * 容器式分层：只读基础镜像 + 精简运行时 + 可回收的临时层
+ * Runtime storage accounting & safe pruning (`layers.js`).
  *
- * 比喻（和 Docker 一样）：
- *   system-images/  = 只读 base layer，所有应用、所有会话共享一份，绝不复制
- *   avd/*.avd/      = 可写 thin layer（qcow2 差量 + quickboot 快照），只存改动
- *   _tmp/ snapshots = 可回收的 scratch layer
- *
- * 本模块只做「盘点」与「按明确清单回收」，默认 dryRun，不碰用户个人文件。
+ * Layered directory model:
+ *  Layer 0 — `app/`              UI + Node core (read-only)
+ *  Layer 1 — `platform-tools/`   ADB toolchain (~15 MB)
+ *  Layer 2 — `emulator/`         QEMU2 + Ranchu engine (~450 MB)
+ *  Layer 3 — `system-images/`    Read-only Android base image (~1.5 GB)
+ *  Layer 4 — `avd/apkstart.avd/` Mutable `/data` overlay + quickboot snapshots (may live outside `root`!)
+ *  Layer 5 — `_dl/`              Temporary download staging (safe to delete anytime)
  */
 const fs = require('fs');
 const path = require('path');
 
-function walk(dir, out = [], depth = 0) {
-  if (depth > 6) return out;
-  let items = [];
-  try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return out; }
-  for (const it of items) {
-    const p = path.join(dir, it.name);
-    if (it.isDirectory()) walk(p, out, depth + 1);
-    else {
-      try { out.push({ path: p, size: fs.statSync(p).size }); } catch (_) { /* ignore */ }
+function dirSize(p) {
+  if (!p || !fs.existsSync(p)) return 0;
+  let st;
+  try { st = fs.statSync(p); } catch (_) { return 0; }
+  if (st.isFile()) return st.size;
+  let total = 0;
+  let entries = [];
+  try { entries = fs.readdirSync(p, { withFileTypes: true }); } catch (_) { return 0; }
+  for (const e of entries) {
+    const full = path.join(p, e.name);
+    if (e.isDirectory()) total += dirSize(full);
+    else if (e.isFile()) {
+      try { total += fs.statSync(full).size; } catch (_) { /* ignore */ }
     }
   }
-  return out;
+  return total;
 }
 
-function dirSize(dir) { return walk(dir).reduce((n, f) => n + f.size, 0); }
-const exists = (p) => { try { return fs.existsSync(p); } catch (_) { return false; } };
+function fmtBytes(n) {
+  if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`;
+  if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+function isInside(child, parent) {
+  if (!child || !parent) return false;
+  const c = path.resolve(child).toLowerCase();
+  const p = path.resolve(parent).toLowerCase();
+  return c === p || c.startsWith(p + path.sep);
+}
 
 /**
- * 盘点运行时占用，并列出「可安全回收」的条目。
- * @returns {{total:number, groups:Array, candidates:Array}}
+ * Scan runtime directories and return layer sizes + reclaimable cleanup candidates.
+ * @param {string} root runtime root directory
+ * @param {object} opts { activeSysImgDir, activeAvdName, avdHome, aggressive, includeSnapshots }
  */
-function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnapshots = false } = {}) {
-  const groups = [];
+function analyze(root, opts = {}) {
+  const activeAvd = opts.activeAvdName || 'apkstart';
+  const activeImg = opts.activeSysImgDir ? path.resolve(opts.activeSysImgDir) : null;
+  const resolvedAvdHome = opts.avdHome ? path.resolve(opts.avdHome) : path.join(root, 'avd');
+  const avdInsideRoot = isInside(resolvedAvdHome, root);
+
+  const layers = [
+    { id: 'platform-tools', name: 'ADB Toolchain', path: path.join(root, 'platform-tools') },
+    { id: 'emulator', name: 'Emulator Engine', path: path.join(root, 'emulator') },
+    { id: 'system-images', name: 'Android System Images', path: path.join(root, 'system-images') },
+    { id: 'avd', name: 'User Data & Snapshots', path: resolvedAvdHome },
+    { id: 'qemu', name: 'Standalone QEMU (Optional)', path: path.join(root, 'qemu') },
+    { id: '_dl', name: 'Download Cache', path: path.join(root, '_dl') },
+  ].map((l) => ({ ...l, size: dirSize(l.path) }));
+
+  const seenPaths = new Set();
   const candidates = [];
-  if (!exists(root)) return { total: 0, groups, candidates };
-
-  const groupOf = (name, dir) => {
-    const size = dirSize(dir);
-    groups.push({ name, size });
-    return size;
+  const addCandidate = (kind, p, reason) => {
+    const key = path.resolve(p).toLowerCase();
+    if (seenPaths.has(key)) return;
+    seenPaths.add(key);
+    candidates.push({ kind, path: p, size: dirSize(p), reason });
   };
-  const add = (p, size, reason, kind = 'file') => candidates.push({ path: p, size, reason, kind });
 
-  groupOf('emulator 引擎', path.join(root, 'emulator'));
-  groupOf('系统镜像（只读基础层）', path.join(root, 'system-images'));
-  groupOf('AVD 可写层 / 快照', path.join(root, 'avd'));
-  groupOf('platform-tools', path.join(root, 'platform-tools'));
+  // 1) Temporary download cache `_dl`
+  const dl = path.join(root, '_dl');
+  if (fs.existsSync(dl)) {
+    for (const f of fs.readdirSync(dl)) {
+      addCandidate('dl-cache', path.join(dl, f), 'Completed or interrupted temporary download');
+    }
+  }
 
-  // 1) QEMU 只需要 x86_64 一个目标；包里另外 7 个架构的二进制纯属浪费
-  const qemuDir = path.join(root, 'emulator', 'qemu', 'windows-x86_64');
-  if (exists(qemuDir)) {
-    for (const f of walk(qemuDir)) {
-      if (/qemu-system-(aarch64|armel|i386)/i.test(path.basename(f.path))) {
-        add(f.path, f.size, '非 x86_64 的 QEMU 目标，运行时用不到');
+  // 2) Inactive system images (when multiple API levels/tags are installed).
+  // If the caller did not provide the active image, preserve the newest image and
+  // offer older/sibling images as reclaimable rather than silently keeping all of them.
+  const sysRoot = path.join(root, 'system-images');
+  if (fs.existsSync(sysRoot)) {
+    const images = [];
+    for (const api of fs.readdirSync(sysRoot)) {
+      const apiDir = path.join(sysRoot, api);
+      if (!fs.statSync(apiDir).isDirectory()) continue;
+      for (const tag of fs.readdirSync(apiDir)) {
+        const tagDir = path.join(apiDir, tag);
+        if (!fs.statSync(tagDir).isDirectory()) continue;
+        for (const abi of fs.readdirSync(tagDir)) {
+          const full = path.resolve(path.join(tagDir, abi));
+          if (!fs.existsSync(full)) continue;
+          const apiNumber = Number((/\d+/.exec(api) || [0])[0]);
+          const tagWeight = /playstore/i.test(tag) ? 300 : (/google_apis/i.test(tag) ? 200 : 100);
+          images.push({ full, api, tag, abi, rank: apiNumber * 1000 + tagWeight });
+        }
+      }
+    }
+    const inferredActive = activeImg || (images.slice().sort((a, b) => b.rank - a.rank)[0] || {}).full;
+    for (const image of images) {
+      if (image.full !== inferredActive) {
+        addCandidate('unused-sysimg', image.full, `Unused system image (${image.api}/${image.tag}/${image.abi})`);
       }
     }
   }
 
-  // 2) 镜像包里的许可证文本 / 冗余目录
-  for (const f of walk(path.join(root, 'system-images'))) {
-    if (/^(NOTICE\.txt|source\.properties)$/i.test(path.basename(f.path)) && f.size > 1024 * 1024) {
-      add(f.path, f.size, '镜像包内的大体积说明文件');
-    }
-  }
-
-  // 3) 只保留一份系统镜像：API 34 Play 镜像就位后，API 30 的旧镜像全部过期
-  const play34 = path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64', 'system.img');
-  if (exists(play34)) {
-    const legacy = path.join(root, 'system-images', 'android-30');
-    if (exists(legacy)) add(legacy, dirSize(legacy), '旧版 API 30 镜像（含过时的 ARM 翻译层）', 'dir');
-  }
-  const stray = path.join(root, 'x86_64');
-  if (exists(stray)) add(stray, dirSize(stray), '解压错位产生的重复镜像目录', 'dir');
-
-  // 4) 非活动 AVD：产品只用 apkstart 一个；测试期遗留的 apkstart-arm / -houdini 等可清
-  const avdHome = path.join(root, 'avd');
-  if (exists(avdHome)) {
-    for (const e of fs.readdirSync(avdHome, { withFileTypes: true })) {
-      if (!e.isDirectory() || !e.name.endsWith('.avd') || e.name === keepAvd) continue;
-      add(path.join(avdHome, e.name), dirSize(path.join(avdHome, e.name)),
-        '非活动 AVD（含 8-16GB 的旧用户数据镜像）', 'dir');
-    }
-    // 5) 锁文件：残留会导致「AVD is already running」
-    for (const f of walk(avdHome)) {
-      if (/\.lock$/i.test(f.path)) add(f.path, f.size, '上次异常退出残留的锁文件');
-    }
-    // 6) 快速启动快照：ram.img ≈ 分配给虚拟机的内存，损坏或配置变更后必须丢弃
-    const activeAvd = path.join(avdHome, keepAvd);
-    if (exists(activeAvd) && !keepSnapshots) {
-      for (const e of fs.readdirSync(activeAvd, { withFileTypes: true })) {
-        // 正常快照 + 删除失败时改名留下的旧快照，都可回收
-        if (!e.isDirectory() || !/^snapshots(\.stale-\d+)?$/.test(e.name)) continue;
-        const p = path.join(activeAvd, e.name);
-        add(p, dirSize(p), '旧 quickboot 快照（配置变更后会自动重建）', 'dir');
+  // 3) AVD lock files, inactive AVDs, legacy `default_boot`, `*.stale-*`, and optional active snapshots
+  const avdRoots = avdInsideRoot ? [resolvedAvdHome] : [resolvedAvdHome, path.join(root, 'avd')];
+  for (const avdRoot of avdRoots) {
+    if (!avdRoot || !fs.existsSync(avdRoot)) continue;
+    for (const entry of fs.readdirSync(avdRoot)) {
+      const full = path.join(avdRoot, entry);
+      if (/\.lock$/i.test(entry)) {
+        addCandidate('lock', full, 'Stale AVD lock file');
+        continue;
+      }
+      if (!entry.endsWith('.avd')) continue;
+      const name = entry.slice(0, -4);
+      if (name !== activeAvd) {
+        addCandidate('unused-avd', full, `Inactive virtual device (${name})`);
+        continue;
+      }
+      for (const sub of fs.readdirSync(full)) {
+        const sp = path.join(full, sub);
+        if (/\.lock$/i.test(sub)) {
+          addCandidate('lock', sp, 'Stale AVD lock file');
+        } else if (/^cache\.img(\.qcow2)?$/i.test(sub)) {
+          addCandidate('avd-cache', sp, 'Android /cache partition (regenerated automatically)');
+        } else if (/^snapshots\.stale-/i.test(sub)) {
+          addCandidate('snapshot', sp, 'Stale renamed snapshot directory');
+        } else if (sub === 'snapshots') {
+          if (opts.includeSnapshots) {
+            addCandidate('snapshot', sp, 'Quickboot snapshots (saved RAM state; apps & data are preserved)');
+          } else {
+            try {
+              for (const snap of fs.readdirSync(sp)) {
+                if (snap !== 'apkstart') {
+                  addCandidate('snapshot', path.join(sp, snap), `Legacy unused snapshot (${snap})`);
+                }
+              }
+            } catch (_) { /* ignore */ }
+          }
+        }
       }
     }
   }
 
-  // 7) 下载缓存 / QEMU 遗留 ISO
-  for (const d of ['_tmp', 'images']) {
-    const p = path.join(root, d);
-    if (exists(p)) {
-      const size = dirSize(p);
-      if (size > 0) add(p, size, d === '_tmp' ? '下载临时文件' : '旧的 QEMU/ISO 遗留文件', 'dir');
+  // Non-x86_64 Windows QEMU binaries are not used by ApkStart and can be reclaimed.
+  const windowsQemu = path.join(root, 'emulator', 'qemu', 'windows-x86_64');
+  if (fs.existsSync(windowsQemu)) {
+    for (const entry of fs.readdirSync(windowsQemu)) {
+      if (/^qemu-system-(?!x86_64\.exe$)[^.]+.*\.exe$/i.test(entry)) {
+        addCandidate('emu-trim', path.join(windowsQemu, entry), 'Unused non-x86_64 QEMU executable');
+      }
     }
   }
 
-  // 8) 激进裁剪：仅构建发行包时启用。
-  // 注意：Qt6WebEngineCoreAndroidEmu.dll 是 qemu-system-x86_64.exe 的加载时依赖，
-  // 实测删掉会直接起不来，绝不能放进清单；qsn/netsim 也可能被快照与网络功能按需调用，保守保留。
-  if (aggressive) {
-    const extras = [
-      ['emulator/crashreport.exe', '崩溃上报工具（无头运行不需要）'],
-    ];
-    for (const [rel, reason] of extras) {
-      const p = path.join(root, rel);
-      if (exists(p)) add(p, fs.statSync(p).size, reason);
+  // 4) Optional emulator trimmings in aggressive mode
+  if (opts.aggressive) {
+    const emu = path.join(root, 'emulator');
+    for (const rel of [
+      ['qemu', 'linux-x86_64'],
+      ['qemu', 'darwin-x86_64'],
+      ['qemu', 'darwin-aarch64'],
+      ['lib64', 'qt', 'translations'],
+      ['resources', 'Toren1BD.pt'],
+    ]) {
+      const p = path.join(emu, ...rel);
+      if (fs.existsSync(p)) {
+        addCandidate('emu-trim', p, `Unused cross-platform emulator asset (${rel.join('/')})`);
+      }
     }
   }
 
-  const total = groups.reduce((n, g) => n + g.size, 0);
-  return { total, groups, candidates };
+  const total = layers.reduce((s, l) => s + l.size, 0);
+  const reclaimable = candidates.reduce((s, c) => s + c.size, 0);
+  return { layers, candidates, total, reclaimable, fmtBytes };
 }
 
 /**
- * 回收。必须显式传 apply:true；调用方（UI/构建脚本）负责先展示清单并取得确认。
- * 安全约束：任何目标都必须在 root 之内，且不允许把 root 自身删掉。
+ * Execute pruning (`apply=false` performs a dry-run preview).
+ * Allows paths inside `root` OR inside `opts.avdHome`.
  */
-function prune(root, { apply = false, keepAvd, aggressive = false, keepSnapshots = false, onRemove = () => {} } = {}) {
-  const report = analyze(root, { keepAvd, aggressive, keepSnapshots });
-  const rootAbs = path.resolve(root);
+function prune(root, opts = {}) {
+  const plan = analyze(root, opts);
+  if (!opts.apply) return { ...plan, removed: [], saved: 0, dryRun: true };
+
+  const resolvedRoot = path.resolve(root);
+  const resolvedAvd = opts.avdHome ? path.resolve(opts.avdHome) : null;
   const removed = [];
   let saved = 0;
-  for (const c of report.candidates) {
-    const p = path.resolve(c.path);
-    if (p === rootAbs || !p.startsWith(rootAbs + path.sep)) continue;
-    if (!exists(p)) continue;
-    if (apply) {
-      try {
-        fs.rmSync(p, c.kind === 'dir' ? { recursive: true, force: true } : { force: true });
-        removed.push(c);
-        saved += c.size;
-        onRemove(c);
-      } catch (_) { /* 占用中的文件跳过，下次再清 */ }
-    }
+
+  for (const c of plan.candidates) {
+    const target = path.resolve(c.path);
+    const allowedInRoot = target !== resolvedRoot && isInside(target, resolvedRoot);
+    const allowedInAvd = resolvedAvd && target !== resolvedAvd && isInside(target, resolvedAvd);
+    if (!allowedInRoot && !allowedInAvd) continue;
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      if (c.kind === 'unused-avd') {
+        const ini = target.replace(/\.avd$/i, '.ini');
+        if (fs.existsSync(ini)) fs.rmSync(ini, { force: true });
+      }
+      removed.push(c);
+      saved += c.size;
+    } catch (_) { /* Locked by live process; skip safely */ }
   }
-  return { ...report, apply, removed, saved, after: apply ? report.total - saved : report.total };
+  return { ...plan, removed, saved, dryRun: false };
 }
 
-/** 给设置页用的简短摘要 */
-function summary(root) {
-  const a = analyze(root);
-  const mb = (n) => (n >= 1048576 * 1024
-    ? `${(n / 1073741824).toFixed(2)} GB`
-    : `${(n / 1048576).toFixed(0)} MB`);
-  // 除了运行时目录，用户最关心「这东西一共占了我多少盘」：
-  // AVD（应用数据 + 快照）、APK 缓存、图标、日志都算进来。
-  const store = require('./store');
-  const extra = [
-    { key: 'avd', label: '安卓数据（应用 + 快照）', path: path.join(store.DATA_DIR, 'avd') },
-    { key: 'apk', label: 'APK 安装包缓存', path: store.APK_DIR },
-    { key: 'icons', label: '桌面图标缓存', path: store.ICON_DIR },
-    { key: 'logs', label: '日志', path: path.join(store.DATA_DIR, 'logs') },
-  ].map((g) => ({ ...g, size: dirSize(g.path) })).filter((g) => g.size > 0);
-
-  const extraTotal = extra.reduce((n, g) => n + g.size, 0);
-  const totalAll = a.total + extraTotal;
+function summary(root, opts = {}) {
+  const r = analyze(root, opts);
   return {
-    total: totalAll,
-    totalText: mb(totalAll),
-    runtimeText: mb(a.total),
-    groups: [
-      { key: 'runtime', label: '运行时（引擎 + 系统镜像）', size: a.total, text: mb(a.total) },
-      ...extra.map((g) => ({ ...g, text: mb(g.size) })),
-    ],
-    reclaimable: a.candidates.reduce((n, c) => n + c.size, 0),
-    reclaimableText: mb(a.candidates.reduce((n, c) => n + c.size, 0)),
-    count: a.candidates.length,
+    total: r.total,
+    totalText: fmtBytes(r.total),
+    reclaimable: r.reclaimable,
+    reclaimableText: fmtBytes(r.reclaimable),
+    layers: r.layers.map((l) => ({ ...l, sizeText: fmtBytes(l.size) })),
+    count: r.candidates.length,
   };
 }
 
-module.exports = { analyze, prune, summary, walk, dirSize };
+function verifyPreserved(root) {
+  const missing = [];
+  for (const rel of ['platform-tools/adb.exe', 'emulator/emulator.exe']) {
+    if (!fs.existsSync(path.join(root, rel))) missing.push(rel);
+  }
+  const images = path.join(root, 'system-images');
+  let imageFound = false;
+  const walk = (dir, depth = 0) => {
+    if (imageFound || depth > 5 || !fs.existsSync(dir)) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    const files = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+    if ((files.has('kernel-ranchu') || files.has('kernel-ranchu-64'))
+        && ['system.img', 'system.img.gz', 'system.img.xz'].some((name) => files.has(name))) {
+      imageFound = true;
+      return;
+    }
+    for (const entry of entries) if (entry.isDirectory()) walk(path.join(dir, entry.name), depth + 1);
+  };
+  walk(images);
+  if (!imageFound) missing.push('system-images/*/*/*/{kernel-ranchu,system.img}');
+  return { ok: missing.length === 0, missing };
+}
+
+module.exports = { analyze, prune, summary, verifyPreserved, dirSize, fmtBytes };

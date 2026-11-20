@@ -1,51 +1,51 @@
 'use strict';
 /**
- * 运行时瘦身：删掉模拟器里「我们的启动方式永远不会加载」的文件。
+ * Trim runtime files that ApkStart never loads.
  *
- * 判断依据是 emulator.js 的固定启动参数：
- *   - 只带 x86_64 镜像（API30 AOSP）      → qemu-system-aarch64.exe 用不上
- *   - -gpu software（swiftshader 软渲染） → vulkan / gles_angle 后端用不上
- *   - 界面只保留 38px 标题栏               → 模拟器自带界面的多语言、WebEngine 面板用不上
+ * Decisions are based on the fixed startup arguments in emulator.js:
+ *   - Only x86_64 images are shipped (API 30 AOSP) → qemu-system-aarch64.exe is not needed.
+ *   - -gpu software (SwiftShader rendering) → Vulkan / GLES ANGLE backends are not needed.
+ *   - The UI keeps only a 38 px title bar → emulator UI locales and WebEngine panels are not needed.
  *
- * 网络相关的 netsimd / netsim / nimble_bridge 一定保留：
- * 它们负责 wifi / 蓝牙的数据通路，删了应用就上不了网，属于「能跑」的底线。
+ * Always preserve network components: netsimd, netsim, and nimble_bridge.
+ * They provide Wi-Fi and Bluetooth networking; removing them breaks app connectivity.
  *
- * 用法：
- *   node build/slim-runtime.js build/runtime          # 安全档（默认）
- *   node build/slim-runtime.js build/runtime --aggressive   # 再删 QtWebEngine（-169MB）
+ * Usage:
+ *   node build/slim-runtime.js build/runtime          # safe profile (default)
+ *   node build/slim-runtime.js build/runtime --aggressive   # also remove QtWebEngine (-169 MB)
  *   node build/slim-runtime.js build/runtime --dry-run
  */
 const fs = require('fs');
 const path = require('path');
 
 /**
- * 安全档：删掉确实不会被加载的东西（约 -190MB）。
- * 实测单点回滚确认的边界（重要，别乱加）：
- *   - Qt6WebEngineCoreAndroidEmu.dll 是 emulator.exe 的硬依赖（静态导入），删了直接起不来 → 保留
- *   - lib64/gles_angle 提供 vk_swiftshader，swiftshader 软渲染依赖它 → 保留
- *   - lib64/vulkan 删掉只是退回软渲染（已实测能正常引导 + 渲染），但留着也不大 → 删掉省 103MB
+ * Safe profile: remove files confirmed not to be loaded (about 190 MB).
+ * These boundaries were confirmed by reverting one item at a time; do not remove additional files:
+ *   - Qt6WebEngineCoreAndroidEmu.dll is statically imported by emulator.exe; removing it prevents startup. Keep it.
+ *   - lib64/gles_angle provides vk_swiftshader, required for SwiftShader rendering. Keep it.
+ *   - Removing lib64/vulkan falls back to software rendering (tested successfully); it saves 103 MB.
  */
 const SAFE = [
-  ['emulator/qemu/windows-x86_64/qemu-system-aarch64.exe', 'arm64 的 QEMU 二进制（只发 x86_64 镜像）'],
-  // 注意：不能整目录删 emulator/lib64/vulkan —— vulkan-1.dll 是 -gpu host 的加载器，
-  // 删了 host 会直接失败、只剩软件渲染（实测 AMD 780M 上必须保留）。只删大件：
-  ['emulator/lib64/vulkan/layers', 'Vulkan 校验层（host 渲染用不到，-20MB）'],
-  ['emulator/lib64/vulkan/glslangValidator.exe', '着色器校验工具（运行时用不到，-7MB）'],
-  ['emulator/lib64/vulkan/libvulkan_lvp.dll', 'lavapipe 软件 Vulkan 后备（有系统显卡驱动时用不到，-53MB）'],
-  ['emulator/lib64/vulkan/lvp_icd.json', 'lavapipe 的 ICD 描述（-1KB）'],
-  ['emulator/lib64/vulkan/vk_swiftshader.dll', 'SwiftShader Vulkan（gles_angle 目录里有同款副本，-23MB）'],
-  ['emulator/lib64/qt/translations', '模拟器界面的多语言包（只剩 38px 标题栏）'],
-  // 注意：不能删 emulator-check.exe —— emulator -accel-check 靠它检测 AEHD/WHPX，
-  // 缺了会判定"无硬件加速"退回 TCG 软件模拟（实测开机从 42s 变成 10 分钟+）。
-  ['emulator/qsn.exe', 'QEMU 快照通知助手（emulator.exe 无任何引用，已 strings 实证，-34MB）'],
-  ['emulator/resources/Toren1BD_Main.png', 'VR 全景环境贴图（红果用不到，-3.7MB）'],
-  ['emulator/resources/Toren1BD_Decor.png', 'VR 全景装饰贴图（-3.5MB）'],
-  ['emulator/resources/Toren1BD.obj', 'VR 全景 3D 模型（-3.5MB）'],
-  ['emulator/resources/macroPreviews', '宏操作预览图（-2.7MB）'],
-  ['emulator/resources/default360.mp4', '360° 全景默认视频（-2.4MB）'],
+  ['emulator/qemu/windows-x86_64/qemu-system-aarch64.exe', 'ARM64 QEMU binary (only x86_64 images are shipped)'],
+  // Do not remove the entire emulator/lib64/vulkan directory: vulkan-1.dll loads the -gpu host backend,
+  // and removing it breaks host rendering (confirmed necessary on AMD 780M). Remove only the large files below:
+  ['emulator/lib64/vulkan/layers', 'Vulkan validation layers (not needed for host rendering, -20 MB)'],
+  ['emulator/lib64/vulkan/glslangValidator.exe', 'Shader validation tool (not needed at runtime, -7 MB)'],
+  ['emulator/lib64/vulkan/libvulkan_lvp.dll', 'Lavapipe software Vulkan fallback (unused when a system GPU driver is available, -53 MB)'],
+  ['emulator/lib64/vulkan/lvp_icd.json', 'Lavapipe ICD descriptor (-1 KB)'],
+  ['emulator/lib64/vulkan/vk_swiftshader.dll', 'SwiftShader Vulkan (duplicate exists under gles_angle, -23 MB)'],
+  ['emulator/lib64/qt/translations', 'Emulator UI locale packs (only the 38 px title bar remains)'],
+  // Do not remove emulator-check.exe: emulator -accel-check uses it to detect AEHD/WHPX.
+  // Without it, hardware acceleration appears unavailable and TCG can increase boot time from 42 seconds to over 10 minutes.
+  ['emulator/qsn.exe', 'QEMU snapshot notification helper (no references in emulator.exe, confirmed with strings, -34 MB)'],
+  ['emulator/resources/Toren1BD_Main.png', 'VR panorama environment texture (unused, -3.7 MB)'],
+  ['emulator/resources/Toren1BD_Decor.png', 'VR panorama decoration texture (-3.5 MB)'],
+  ['emulator/resources/Toren1BD.obj', 'VR panorama 3D model (-3.5 MB)'],
+  ['emulator/resources/macroPreviews', 'Macro-action preview images (-2.7 MB)'],
+  ['emulator/resources/default360.mp4', 'Default 360-degree panorama video (-2.4 MB)'],
 ];
 
-/** 激进档目前为空：WebEngine 是硬依赖、gles_angle 是软渲染依赖，都不敢删 */
+/** The aggressive profile is currently empty: WebEngine and gles_angle are required dependencies. */
 const AGGRESSIVE = [];
 
 function sizeOf(p) {
@@ -54,13 +54,13 @@ function sizeOf(p) {
     const st = fs.statSync(p);
     if (!st.isDirectory()) return st.size;
     for (const e of fs.readdirSync(p, { withFileTypes: true })) s += sizeOf(path.join(p, e.name));
-  } catch (_) { /* 忽略 */ }
+  } catch (_) { /* Ignore. */ }
   return s;
 }
 
 function slim(root, { aggressive = false, dryRun = false, log = console.log } = {}) {
   if (!fs.existsSync(path.join(root, 'emulator', 'emulator.exe'))) {
-    throw new Error(`${root} 不是一个运行时目录（缺 emulator/emulator.exe）`);
+    throw new Error(`${root} is not a runtime directory (emulator/emulator.exe is missing)`);
   }
   const list = aggressive ? SAFE.concat(AGGRESSIVE) : SAFE;
   let freed = 0;
@@ -72,14 +72,14 @@ function slim(root, { aggressive = false, dryRun = false, log = console.log } = 
       try {
         fs.rmSync(p, { recursive: true, force: true });
       } catch (e) {
-        log(`  跳过 ${rel}：${e.message}`);
+        log(`  Skipped ${rel}: ${e.message}`);
         continue;
       }
     }
     freed += n;
-    log(`  删除 ${rel}（${(n / 1048576).toFixed(0)} MB）— ${why}`);
+    log(`  Removed ${rel} (${(n / 1048576).toFixed(0)} MB) — ${why}`);
   }
-  log(`${dryRun ? '可释放' : '已释放'} ${(freed / 1048576).toFixed(0)} MB`);
+  log(`${dryRun ? 'Reclaimable' : 'Reclaimed'} ${(freed / 1048576).toFixed(0)} MB`);
   return freed;
 }
 
@@ -89,6 +89,6 @@ if (require.main === module) {
   const root = path.resolve(process.argv[2] || path.join(__dirname, 'runtime'));
   const aggressive = process.argv.includes('--aggressive');
   const dryRun = process.argv.includes('--dry-run');
-  console.log(`瘦身目标：${root}（${aggressive ? '激进' : '安全'}档）`);
+  console.log(`Runtime cleanup target: ${root} (${aggressive ? 'aggressive' : 'safe'} profile)`);
   slim(root, { aggressive, dryRun });
 }

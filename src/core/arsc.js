@@ -1,233 +1,216 @@
 'use strict';
 /**
- * resources.arsc 解析器（精简版）
- * 用途：把 AndroidManifest 里的 @0x7f... 资源引用还原成
- *       应用名（字符串）和图标文件路径（res/... 下的 png）。
+ * Android `resources.arsc` binary parser (zero external dependencies).
  *
- * 只解析 ResTable / ResTable_package / ResTable_type 三层结构，
- * 足以覆盖 99% 的应用名与图标场景。
+ * Resolves `@0x7fXXXXXX` resource IDs for application labels, version names,
+ * and highest-DPI launcher icons (including Android 8+ adaptive-icon XML trees).
  */
+const { readStringPool } = require('./axml');
 
 const RES_TABLE_TYPE = 0x0002;
 const RES_STRING_POOL_TYPE = 0x0001;
 const RES_TABLE_PACKAGE_TYPE = 0x0200;
-const RES_TABLE_TYPE_TYPE = 0x0201;
 const RES_TABLE_TYPE_SPEC_TYPE = 0x0202;
+const RES_TABLE_TYPE_TYPE = 0x0201;
+
+const FLAG_SPARSE = 0x01;
+const FLAG_OFFSET16 = 0x02;
 
 const TYPE_REFERENCE = 0x01;
 const TYPE_STRING = 0x03;
-const TYPE_INT_DEC = 0x10;
-const TYPE_INT_HEX = 0x11;
-const TYPE_INT_BOOLEAN = 0x12;
-
-function readStringPool(buf, start) {
-  const headerSize = buf.readUInt16LE(start + 2);
-  const count = buf.readUInt32LE(start + 8);
-  const flags = buf.readUInt32LE(start + 16);
-  const stringsStart = buf.readUInt32LE(start + 20);
-  const isUtf8 = (flags & 0x100) !== 0;
-  const base = start + stringsStart;
-  const out = new Array(count);
-  for (let i = 0; i < count; i++) {
-    let p = base + buf.readUInt32LE(start + headerSize + i * 4);
-    if (isUtf8) {
-      let len = buf[p++];
-      if (len & 0x80) { len = ((len & 0x7f) << 8) | buf[p++]; }
-      let byteLen = buf[p++];
-      if (byteLen & 0x80) { byteLen = ((byteLen & 0x7f) << 8) | buf[p++]; }
-      out[i] = buf.toString('utf8', p, p + byteLen);
-    } else {
-      let len = buf.readUInt16LE(p); p += 2;
-      if (len & 0x8000) { len = ((len & 0x7fff) << 16) | buf.readUInt16LE(p); p += 2; }
-      out[i] = buf.toString('utf16le', p, p + len * 2);
-    }
-  }
-  return out;
-}
-
-function parseConfig(buf, off) {
-  const size = buf.readUInt32LE(off);
-  const cfg = { size, density: 0, language: '', country: '', sdkVersion: 0, isDefault: true };
-  if (size >= 16) {
-    const lang = buf.toString('latin1', off + 8, off + 10).replace(/\0/g, '').trim();
-    const country = buf.toString('latin1', off + 10, off + 12).replace(/\0/g, '').trim();
-    cfg.language = lang;
-    cfg.country = country;
-  }
-  if (size >= 16) cfg.density = buf.readUInt16LE(off + 14);
-  if (size >= 28) cfg.sdkVersion = buf.readUInt16LE(off + 24);
-  if (size >= 29) cfg.uiMode = buf.readUInt8(off + 29);
-  cfg.isDefault = !cfg.language && !cfg.country && cfg.density === 0 && !cfg.sdkVersion;
-  return cfg;
-}
-
-/** 为不同用途的取值打分：字符串偏好默认配置，图片偏好高密度 */
-function score(cfg, prefer) {
-  let s = 0;
-  if (prefer === 'file') {
-    s += cfg.density === 0 ? 0 : cfg.density;          // 高密度优先
-    if (cfg.density === 0xfffe) s -= 500;               // anydpi 可能是 xml，扣分
-  } else {
-    s -= cfg.density === 0 ? 0 : 10;                    // 字符串：无密度优先
-    if (cfg.language) s -= 40;
-    if (cfg.sdkVersion) s -= cfg.sdkVersion / 1000;
-    if (cfg.uiMode) s -= 20;
-  }
-  return s;
-}
 
 class ResTable {
-  constructor(buffer) {
-    this.buf = buffer;
+  constructor(buf, opts = {}) {
+    this.buf = buf;
+    this.preferredLang = opts.preferredLang || 'en';
     this.globalStrings = [];
-    this.packages = [];
+    this.packages = new Map();
     this._parse();
   }
 
   _parse() {
     const buf = this.buf;
-    if (buf.readUInt16LE(0) !== RES_TABLE_TYPE) throw new Error('resources.arsc 格式错误');
+    if (buf.length < 12 || buf.readUInt16LE(0) !== RES_TABLE_TYPE) {
+      throw new Error('Not a valid resources.arsc binary table');
+    }
     const headerSize = buf.readUInt16LE(2);
-    const total = buf.readUInt32LE(4);
-    const pkgCount = buf.readUInt32LE(8);
+    const totalSize = Math.min(buf.length, buf.readUInt32LE(4));
 
     let pos = headerSize;
-    while (pos < total && pos < buf.length) {
-      const type = buf.readUInt16LE(pos);
-      const chunkSize = buf.readUInt32LE(pos + 4);
-      if (chunkSize <= 0) break;
-      if (type === RES_STRING_POOL_TYPE && this.globalStrings.length === 0) {
+    while (pos + 8 <= totalSize) {
+      const cType = buf.readUInt16LE(pos);
+      const cSize = buf.readUInt32LE(pos + 4);
+      if (cSize < 8 || pos + cSize > totalSize) break;
+      if (cType === RES_STRING_POOL_TYPE) {
         this.globalStrings = readStringPool(buf, pos);
-      } else if (type === RES_TABLE_PACKAGE_TYPE) {
-        this.packages.push(this._parsePackage(pos, chunkSize));
+      } else if (cType === RES_TABLE_PACKAGE_TYPE) {
+        this._parsePackage(pos, pos + cSize);
       }
-      pos += chunkSize;
+      pos += cSize;
     }
   }
 
-  _parsePackage(start, size) {
+  _parsePackage(start, end) {
     const buf = this.buf;
+    const headerSize = buf.readUInt16LE(start + 2);
     const id = buf.readUInt32LE(start + 8);
     const typeStringsOff = buf.readUInt32LE(start + 268);
     const keyStringsOff = buf.readUInt32LE(start + 276);
-    const headerSize = buf.readUInt16LE(start + 2);
 
-    let typeStrings = [];
-    let keyStrings = [];
-    try {
-      if (typeStringsOff) typeStrings = readStringPool(buf, start + typeStringsOff);
-      if (keyStringsOff) keyStrings = readStringPool(buf, start + keyStringsOff);
-    } catch (_) { /* 容错：缺字符串池不影响主流程 */ }
+    const pkg = {
+      id,
+      typeStrings: typeStringsOff ? readStringPool(buf, start + typeStringsOff) : [],
+      keyStrings: keyStringsOff ? readStringPool(buf, start + keyStringsOff) : [],
+      types: new Map(),
+    };
 
-    const types = new Map(); // typeId -> [{ config, entries: Map }]
     let pos = start + headerSize;
-    const end = start + size;
     while (pos + 8 <= end) {
-      const type = buf.readUInt16LE(pos);
-      const chunkSize = buf.readUInt32LE(pos + 4);
-      if (chunkSize <= 0) break;
-      if (type === RES_TABLE_TYPE_TYPE) {
-        const t = this._parseType(pos);
-        if (t) {
-          if (!types.has(t.id)) types.set(t.id, []);
-          types.get(t.id).push(t);
-        }
+      const cType = buf.readUInt16LE(pos);
+      const cSize = buf.readUInt32LE(pos + 4);
+      if (cSize < 8 || pos + cSize > end) break;
+      if (cType === RES_TABLE_TYPE_TYPE) {
+        this._parseType(pkg, pos, pos + cSize);
+      } else if (cType === RES_TABLE_TYPE_SPEC_TYPE) {
+        // TypeSpec holds config masks only; not required for concrete value lookup
       }
-      pos += chunkSize;
+      pos += cSize;
     }
-    return { id, typeStrings, keyStrings, types };
+
+    this.packages.set(id, pkg);
   }
 
-  _parseType(start) {
+  _parseType(pkg, start, end) {
     const buf = this.buf;
     const headerSize = buf.readUInt16LE(start + 2);
-    const id = buf.readUInt8(start + 8);
+    const typeId = buf.readUInt8(start + 8);
     const flags = buf.readUInt8(start + 9);
     const entryCount = buf.readUInt32LE(start + 12);
     const entriesStart = buf.readUInt32LE(start + 16);
-    const cfg = parseConfig(buf, start + 20);
 
-    const entries = new Map();
-    const offsetsBase = start + headerSize;
-    const entriesBase = start + entriesStart;
-
-    if (flags & 0x01) {
-      // FLAG_SPARSE：entryCount 个 (idx:u16, offset:u16)
-      for (let i = 0; i < entryCount; i++) {
-        const idx = buf.readUInt16LE(offsetsBase + i * 4);
-        const off = buf.readUInt16LE(offsetsBase + i * 4 + 2) * 4;
-        const v = this._readValue(entriesBase + off);
-        if (v) entries.set(idx, v);
-      }
-    } else if (flags & 0x02) {
-      // FLAG_OFFSET16
-      for (let i = 0; i < entryCount; i++) {
-        const off = buf.readUInt16LE(offsetsBase + i * 2);
-        if (off === 0xffff) continue;
-        const v = this._readValue(entriesBase + off * 4);
-        if (v) entries.set(i, v);
-      }
-    } else {
-      for (let i = 0; i < entryCount; i++) {
-        const off = buf.readUInt32LE(offsetsBase + i * 4);
-        if (off === 0xffffffff) continue;
-        const v = this._readValue(entriesBase + off);
-        if (v) entries.set(i, v);
-      }
+    const cfgStart = start + 20;
+    const cfgSize = buf.readUInt32LE(cfgStart);
+    let lang = '';
+    let density = 0;
+    if (cfgSize >= 16 && cfgStart + 16 <= end) {
+      const l0 = buf.readUInt8(cfgStart + 8);
+      const l1 = buf.readUInt8(cfgStart + 9);
+      if (l0 && l1 && (l0 & 0x80) === 0) lang = String.fromCharCode(l0, l1);
+      density = buf.readUInt16LE(cfgStart + 14);
     }
-    return { id, config: cfg, entries };
-  }
 
-  _readValue(at) {
-    const buf = this.buf;
-    if (at + 8 > buf.length) return null;
-    const entrySize = buf.readUInt16LE(at);
-    const flags = buf.readUInt16LE(at + 2);
-    if (flags & 0x0001) return null; // 复杂资源（bag/map），此处不处理
-    const valueAt = at + entrySize;
-    return {
-      dataType: buf.readUInt8(valueAt + 3),
-      data: buf.readUInt32LE(valueAt + 4),
-    };
+    const isSparse = (flags & FLAG_SPARSE) !== 0;
+    const isOff16 = (flags & FLAG_OFFSET16) !== 0;
+
+    const offsetsPos = start + headerSize;
+    const dataBase = start + entriesStart;
+    const entries = new Map();
+
+    for (let i = 0; i < entryCount; i++) {
+      let entryIdx = i;
+      let off;
+      if (isSparse) {
+        const p = offsetsPos + i * 4;
+        if (p + 4 > dataBase) break;
+        entryIdx = buf.readUInt16LE(p);
+        off = buf.readUInt16LE(p + 2) * 4;
+      } else if (isOff16) {
+        const p = offsetsPos + i * 2;
+        if (p + 2 > dataBase) break;
+        const v = buf.readUInt16LE(p);
+        if (v === 0xffff) continue;
+        off = v * 4;
+      } else {
+        const p = offsetsPos + i * 4;
+        if (p + 4 > dataBase) break;
+        off = buf.readInt32LE(p);
+        if (off === -1) continue;
+      }
+
+      const ep = dataBase + off;
+      if (ep + 8 > end) continue;
+      const eSize = buf.readUInt16LE(ep);
+      const eFlags = buf.readUInt16LE(ep + 2);
+      const isComplex = (eFlags & 0x0001) !== 0;
+      if (isComplex) continue;
+      if (ep + eSize + 8 > end) continue;
+      const vType = buf.readUInt8(ep + eSize + 3);
+      const vData = buf.readUInt32LE(ep + eSize + 4);
+      entries.set(entryIdx, { type: vType, data: vData });
+    }
+
+    if (!pkg.types.has(typeId)) pkg.types.set(typeId, []);
+    pkg.types.get(typeId).push({ config: { lang, density }, entries });
   }
 
   /**
-   * 解析资源引用
-   * @param {number} ref 0xPPTTEEEE
-   * @param {'string'|'file'|'any'} prefer
-   * @param {number} depth
+   * Resolve all config variants of a resource ID (`0xPPTTEEEE`), following nested
+   * `@ref` indirections up to depth 6.
    */
-  resolve(ref, prefer = 'any', depth = 0) {
-    if (depth > 6 || !ref) return null;
-    const pkgId = (ref >>> 24) & 0xff;
-    const typeId = (ref >>> 16) & 0xff;
-    const entryIdx = ref & 0xffff;
+  resolveAll(resId, depth = 0) {
+    if (depth > 6 || !resId) return [];
+    const pkgId = (resId >>> 24) & 0xff;
+    const typeId = (resId >>> 16) & 0xff;
+    const entryIdx = resId & 0xffff;
+    const pkg = this.packages.get(pkgId);
+    if (!pkg) return [];
+    const list = pkg.types.get(typeId);
+    if (!list) return [];
 
-    const pkg = this.packages.find((p) => p.id === pkgId) || this.packages[0];
-    if (!pkg) return null;
-    const chunks = pkg.types.get(typeId);
-    if (!chunks) return null;
+    const results = [];
+    for (const cfg of list) {
+      const e = cfg.entries.get(entryIdx);
+      if (!e) continue;
+      if (e.type === TYPE_STRING) {
+        const s = this.globalStrings[e.data];
+        if (s !== undefined) results.push({ value: s, config: cfg.config });
+      } else if (e.type === TYPE_REFERENCE && e.data !== resId) {
+        for (const sub of this.resolveAll(e.data, depth + 1)) {
+          results.push({ value: sub.value, config: cfg.config.lang ? cfg.config : sub.config });
+        }
+      }
+    }
+    return results;
+  }
 
-    let best = null;
-    let bestScore = -Infinity;
-    for (const c of chunks) {
-      if (!c.entries.has(entryIdx)) continue;
-      const s = score(c.config, prefer);
-      if (s > bestScore) { bestScore = s; best = c.entries.get(entryIdx); }
-    }
-    if (!best) return null;
+  /**
+   * Resolve a string resource with deterministic locale fallback:
+   *  1) `preferredLang` (defaults to `'en'`) -> +50
+   *  2) Default unqualified config (`lang === ''`) -> +20
+   *  3) `'en'` or `'zh'` fallback -> -5 / -10 (so English/Chinese win over random locales like `af`)
+   *  4) Any other locale -> -40
+   */
+  resolveString(resId, preferredLang) {
+    const want = (preferredLang || this.preferredLang || 'en').toLowerCase();
+    const all = this.resolveAll(resId);
+    if (!all.length) return null;
+    const score = (c) => {
+      const lang = (c.lang || '').toLowerCase();
+      if (lang === want) return 50;
+      if (!lang) return 20;
+      if (lang === 'en') return -5;
+      if (lang === 'zh') return -10;
+      return -40;
+    };
+    all.sort((a, b) => score(b.config) - score(a.config));
+    return all[0].value;
+  }
 
-    if (best.dataType === TYPE_STRING) {
-      const s = this.globalStrings[best.data];
-      return s === undefined ? null : s;
-    }
-    if (best.dataType === TYPE_REFERENCE) {
-      return this.resolve(best.data >>> 0, prefer, depth + 1);
-    }
-    if (best.dataType === TYPE_INT_BOOLEAN) return best.data !== 0;
-    if (best.dataType === TYPE_INT_DEC || best.dataType === TYPE_INT_HEX) return best.data | 0;
-    return null;
+  /**
+   * Resolve candidate icon resource paths sorted from highest useful DPI (480/640) downward,
+   * preferring raster PNG/WebP over XML drawables at equal density.
+   */
+  resolveIconPaths(resId) {
+    const all = this.resolveAll(resId).filter((r) => typeof r.value === 'string');
+    const score = (r) => {
+      const d = r.config.density || 160;
+      const isPng = /\.(png|webp)$/i.test(r.value) ? 1000 : 0;
+      const dpiScore = d === 0xffff ? 300 : Math.min(d, 640);
+      return isPng + dpiScore;
+    };
+    all.sort((a, b) => score(b) - score(a));
+    return [...new Set(all.map((r) => r.value))];
   }
 }
 
-module.exports = { ResTable, TYPE_REFERENCE };
+module.exports = { ResTable };

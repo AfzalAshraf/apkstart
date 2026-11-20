@@ -1,90 +1,97 @@
 'use strict';
 /**
- * 把 Android Emulator 的 Qt 窗口打扮成「一个应用一个原生窗口」。
- *
- * 为什么不投屏：无头模式下 SurfaceFlinger 不出 VSYNC（实测 screenrecord 3 秒只有 2 帧），
- * 软件投屏既卡又吃 CPU。带窗口的模拟器本身就是原生 60fps + 原生鼠标键盘，
- * 这里只做「改标题 / 换图标 / 设尺寸 / 全屏」这几下 Win32 操作，成本近乎为零。
- *
- * PowerShell 是 Windows 自带组件，脚本为纯 ASCII，中文标题通过 UTF-8 JSON 传入，
- * 避免 Windows PowerShell 5.1 按 ANSI 读 .ps1 造成乱码。
- * 任何失败都静默降级：窗口照样能用，只是没有改名/全屏。
+ * Fallback Win32 controller for emulator windows that cannot be embedded.
+ * Requests are sent as UTF-8 JSON files because Windows PowerShell argument
+ * parsing is not reliable for arbitrary Unicode window titles or paths.
  */
+const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const path = require('path');
-const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 const SCRIPT = path.join(__dirname, 'win', 'windowctl.ps1');
-const TIMEOUT = 8000;
 
-function parseOut(text) {
-  const out = {};
-  for (const line of String(text || '').split(/\r?\n/)) {
-    const i = line.indexOf('=');
-    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+class WindowController {
+  constructor() {
+    this.lastMode = null;
   }
-  return out;
-}
 
-/** @param {object} params { pid, action, title, icon, bounds } */
-function call(params) {
-  return new Promise((resolve) => {
-    if (process.platform !== 'win32' || !fs.existsSync(SCRIPT) || !params || params.pid === undefined) {
-      resolve(null);
-      return;
-    }
-    const json = path.join(os.tmpdir(),
-      `apkstart-wctl-${crypto.randomBytes(4).toString('hex')}.json`);
+  available() {
+    return process.platform === 'win32' && fs.existsSync(SCRIPT);
+  }
+
+  _call(payload) {
+    if (!this.available()) return Promise.resolve({ ok: false, skipped: true });
+    const jsonPath = path.join(os.tmpdir(), `apkstart-windowctl-${process.pid}-${Date.now()}.json`);
     try {
-      fs.writeFileSync(json, JSON.stringify(params), 'utf8');
-    } catch (_) { resolve(null); return; }
-
-    execFile('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-File', SCRIPT, json,
-    ], { timeout: TIMEOUT, windowsHide: true, maxBuffer: 1024 * 64 }, (err, stdout) => {
-      try { fs.unlinkSync(json); } catch (_) { /* ignore */ }
-      if (err) { resolve(null); return; }
-      const r = parseOut(stdout);
-      resolve(r.OK === '1' ? r : null);
+      fs.writeFileSync(jsonPath, JSON.stringify(payload), 'utf8');
+    } catch (error) {
+      return Promise.resolve({ ok: false, error: error.message });
+    }
+    return new Promise((resolve) => {
+      execFile('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT, jsonPath,
+      ], { windowsHide: true, timeout: 8000, encoding: 'utf8' }, (error, stdout) => {
+        try { fs.rmSync(jsonPath, { force: true }); } catch (_) { /* ignore */ }
+        if (error) return resolve({ ok: false, error: error.message });
+        const text = String(stdout || '');
+        const result = { ok: /(?:^|\r?\n)OK=1(?:\r?\n|$)/.test(text), raw: text.trim() };
+        for (const [key, name] of [['x', 'X'], ['y', 'Y'], ['w', 'W'], ['h', 'H'], ['maximized', 'MAX']]) {
+          const match = new RegExp(`(?:^|\\r?\\n)${name}=(-?\\d+)`).exec(text);
+          if (match) result[key] = name === 'MAX' ? match[1] === '1' : Number(match[1]);
+        }
+        resolve(result);
+      });
     });
-  });
+  }
+
+  run(mode, width = 0, height = 0) {
+    const action = mode === 'windowed' ? 'window' : mode;
+    const payload = { action, pid: 0 };
+    if (Number(width) > 0 && Number(height) > 0) {
+      payload.bounds = { x: 0, y: 0, w: Math.round(width), h: Math.round(height) };
+    }
+    return this._call(payload).then((result) => {
+      if (result.ok) this.lastMode = action;
+      return result;
+    });
+  }
+
+  present({ pid = 0, title = '', icon = '', bounds, fullscreen = false } = {}) {
+    return this._call({
+      action: fullscreen ? 'fullscreen' : 'window',
+      pid,
+      title,
+      icon,
+      bounds: bounds || undefined,
+    });
+  }
+
+  async getBounds(pid = 0) {
+    const targetPid = typeof pid === 'object' && pid ? pid.pid || 0 : pid;
+    const result = await this._call({ action: 'get', pid: Number(targetPid) || 0 });
+    if (!result.ok) return null;
+    return {
+      x: result.x || 0,
+      y: result.y || 0,
+      width: result.w || 0,
+      height: result.h || 0,
+      maximized: Boolean(result.maximized),
+    };
+  }
+
+  fullscreen() { return this.run('fullscreen'); }
+  windowed(width, height) { return this.run('window', width, height); }
+  restore() { return this.run('window'); }
+  hide() { return this._call({ action: 'hide', pid: 0 }); }
+  show() { return this._call({ action: 'focus', pid: 0 }); }
 }
 
-/** 读取当前窗口位置，用于「记住每个应用的窗口大小」 */
-async function getBounds(pid) {
-  const r = await call({ pid, action: 'get' });
-  if (!r || !Number(r.W) || !Number(r.H)) return null;
-  return {
-    x: Number(r.X) || 0, y: Number(r.Y) || 0,
-    w: Number(r.W), h: Number(r.H),
-    maximized: r.MAX === '1',
-  };
-}
+const defaultController = new WindowController();
 
-/**
- * 让运行时窗口表现为当前应用。
- * @param {object} o { pid, label, icon, mode:'window'|'fullscreen', bounds, screen }
- */
-async function present(o) {
-  const { pid, label, icon, mode, bounds, screen } = o || {};
-  // pid=0 是合法输入：复用别的进程拉起的模拟器时没有句柄，交给脚本按进程名找窗口
-  if (pid === undefined || pid === null) return null;
-  return call({
-    pid,
-    action: mode === 'fullscreen' ? 'fullscreen' : 'window',
-    title: label || '',
-    icon: icon && fs.existsSync(icon) ? icon : '',
-    bounds: bounds || null,
-    screen: mode === 'fullscreen' ? (screen || null) : null,
-  });
-}
-
-async function focus(pid) { return call({ pid, action: 'focus' }); }
-
-/** 通知资源管理器刷新图标/快捷方式，避免新建的桌面图标要按 F5 才出现 */
-async function refreshShell() { return call({ pid: 0, action: 'refresh' }); }
-
-module.exports = { call, getBounds, present, focus, refreshShell, SCRIPT };
+module.exports = {
+  WindowController,
+  SCRIPT,
+  present: (...args) => defaultController.present(...args),
+  getBounds: (...args) => defaultController.getBounds(...args),
+};

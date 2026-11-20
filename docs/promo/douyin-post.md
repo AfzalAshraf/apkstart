@@ -1,72 +1,74 @@
-# 抖音发布素材包 · ApkStart v0.2.2
+# Douyin publishing kit · ApkStart v0.2.2
 
-> 抖音目前没有对个人开放的图文/视频发布 API，也没有可用的自动发布通道。这份素材包已经把「选图 → 贴文案 → 加话题 → 发布」所需的全部内容备齐，按下面步骤 2 分钟即可发。
-> 安装包同样不能挂在抖音作品里：用主页简介 / 置顶评论 / 公众号关键词回复把读者引到 GitHub Release（第 5 张图里有下载二维码）。
+> Douyin does not currently provide an open image/video publishing API or an automated publishing channel for individual creators. This kit contains the images and copy needed to publish manually: choose images, add the caption and hashtags, and publish.
+>
+> Installers cannot be attached to Douyin posts. Link viewers to the GitHub Release from your profile, pinned comment, or a WeChat keyword reply. The fifth image contains download QR codes.
 
-## 一、作品标题（文案首句）
+## 1. Post title / opening line
 
-**自己写了个 Windows 安卓启动器，双击 .apk 就能用，还把字节系应用跑通了**
+**I built a Windows Android launcher: double-click APKs and run ARM-only apps**
 
-备选：
-- 不用装模拟器了！双击 APK 直接在电脑上跑安卓 App
-- 开源免费｜我给 Windows 写了个「安卓应用启动器」，完整版解压即用
+Alternatives:
 
-## 二、正文文案（直接复制）
+- No emulator setup: run Android apps on your PC by double-clicking an APK.
+- Open source and free: a Windows Android app launcher with a ready-to-run full package.
 
-以前在电脑上开个安卓 App 有多麻烦：下载几个 G 的模拟器、装环境、找 APK、拖进去，最后还可能弹一句「CPU 架构不匹配，装不上」。
+## 2. Caption (copy and paste)
 
-干脆自己写了一个：ApkStart 👇
+Running an Android app on your PC used to mean downloading gigabytes of emulator software, setting up the environment, finding an APK, dragging it in, and hoping the CPU architecture matched.
 
-✅ 双击 .apk 就装，自动生成桌面快捷方式
-✅ 每个 App 一个独立窗口，互不打扰
-✅ 电脑和安卓共享文件夹，文件拖进去就能用
-✅ Google 官方引擎 + AEHD 硬件加速，壳层零依赖
+So I built ApkStart 👇
 
-这次 v0.2.2 还干了两件狠活：
-🔥 完整版内置引擎 + Android 14 ARM 兼容镜像，解压双击直接进主界面，零下载零设置
-🔥 老镜像上必崩的字节系应用（实测红果短剧），换新版翻译层后：安装 → 推荐流 → 视频播放，全程不崩
+✅ Double-click an `.apk` to install it and create a desktop shortcut.
+✅ Run each app in its own window.
+✅ Share files between Windows and Android by dragging them into the shared folder.
+✅ Use the official Google engine with AEHD hardware acceleration; the app shell has no third-party runtime dependencies.
 
-两个版本任选：轻量版 0.11GB（首启一键部署）／完整版 1.35GB（开箱即用）
-GitHub 搜 `RoutineMiku/apkstart`，点 Releases 下载，项目完全开源可自行编译 👀
+v0.2.2 also brings two big changes:
+🔥 The full package includes the engine and Android 14 ARM compatibility image. Extract and run—no download or setup.
+🔥 Hongguo Short Drama, which crashed on the old image, installed and played videos with the updated translation layer in our test.
 
-有问题评论区问我，或者来公众号 / 抖音 @日常MIKU 找我～
+Choose a package: portable (0.11 GB; set up the runtime on first launch) or full (1.35 GB; ready to run).
+Find `RoutineMiku/apkstart` on GitHub and open Releases. The project is open source and can be built from source 👀
 
-#安卓模拟器 #开源项目 #Windows技巧 #效率工具 #程序员日常 #ApkStart #ARM兼容 #独立开发
+Questions? Leave a comment or find RoutineMiku on WeChat or Douyin.
 
-## 三、话题标签（复制用）
+#Android #OpenSource #Windows #Productivity #ApkStart #ARMCompatibility #IndieDevelopment
 
-`#安卓模拟器` `#开源项目` `#Windows技巧` `#效率工具` `#程序员日常` `#ApkStart` `#独立开发` `#电脑技巧`
+## 3. Hashtags
 
-## 四、置顶评论
+`#Android` `#OpenSource` `#Windows` `#Productivity` `#ApkStart` `#ARMCompatibility` `#IndieDevelopment` `#PCApps`
 
-> 📦 安装包在这：GitHub 搜索 `RoutineMiku/apkstart` → Releases → v0.2.2
-> 轻量版 0.11GB（首启一键部署）｜完整版 1.35GB（内置引擎+镜像，解压即用）
-> 第 5 张图有下载二维码，长按识别就行。项目开源免费，觉得有用点个星 ⭐
+## 4. Pinned comment
 
-## 五、图文发布步骤
+> 📦 Download: search GitHub for `RoutineMiku/apkstart` → Releases → v0.2.2
+> Portable: 0.11 GB (runtime setup on first launch) · Full: 1.35 GB (engine and image included)
+> The fifth image has download QR codes. The project is free and open source—leave a star if you find it useful ⭐
 
-1. 抖音 App → 「+」→ 选「图文」，按 `douyin-1.png` → `douyin-5.png` 顺序选 5 张图（`docs/promo/assets/`）
-2. 粘贴上面的「正文文案」，选一个标题
-3. 添加话题标签；第 5 张图自带下载二维码，可在图上再加「链接」贴纸指向主页
-4. 发布后把「置顶评论」设为置顶
-5. 若主页简介还没放链接，建议填 GitHub 仓库地址；想给安装包做更顺滑的转化，可用公众号关键词自动回复发 Release 链接
+## 5. Image-post steps
 
-## 六、视频口播脚本（可选，约 35 秒）
+1. In Douyin, tap **+** → **Photo post** and select `douyin-1.png` through `douyin-5.png` from `docs/promo/assets/` in order.
+2. Paste the caption above and choose a title.
+3. Add hashtags. The fifth image already includes download QR codes; optionally add a link sticker to your profile.
+4. Publish and pin the comment above.
+5. Add the GitHub repository to your profile. For a smoother download path, configure a WeChat keyword reply with the Release link.
 
-| 时间 | 画面 | 口播 |
-| --- | --- | --- |
-| 0-5s | 双击一个 .apk，应用窗口弹出 | 「电脑上跑安卓 App，你还在一整个模拟器？」 |
-| 5-12s | 桌面快捷方式、独立窗口并排 | 「我写了个启动器，双击 .apk 就装好，每个应用一个独立窗口。」 |
-| 12-22s | 设置面板开启 ARM 兼容模式 | 「带 ARM 库的应用过去直接装不上，新版内置 Android 14 兼容镜像，一键开启。」 |
-| 22-30s | 红果短剧播放画面 | 「实测红果短剧，安装、进推荐流、播视频，全程不崩。」 |
-| 30-35s | 第 5 张轮播图 | 「两个版本都开源免费，GitHub 搜 RoutineMiku/apkstart，二维码在这，自取。」 |
+## 6. Optional 35-second video script
 
-## 七、图片清单
+| Time | Visual | Voice-over |
+|---|---|---|
+| 0–5 s | Double-click an APK; an app window opens | “Still using a whole emulator just to run one Android app on your PC?” |
+| 5–12 s | Desktop shortcut and separate app windows | “I built a launcher: double-click the APK to install, then run each app in its own window.” |
+| 12–22 s | Enable ARM compatibility in Settings | “ARM-only apps used to fail to install. The new Android 14 compatibility image makes them easier to run.” |
+| 22–30 s | Hongguo Short Drama video playback | “We tested Hongguo Short Drama from install to video playback without a crash.” |
+| 30–35 s | Fifth carousel image | “Both packages are open source and free. Search GitHub for RoutineMiku/apkstart; the QR codes are right here.” |
 
-| 文件 | 内容 |
-| --- | --- |
-| `douyin-1.png` | 封面：Logo + 主标题 |
-| `douyin-2.png` | 痛点：下载慢 / 装不上 / 太臃肿 |
-| `douyin-3.png` | 四个特性 |
-| `douyin-4.png` | ARM 兼容突破（红果短剧实机截图） |
-| `douyin-5.png` | 两版本对照 + 下载二维码 + 抖音号 |
+## 7. Image list
+
+| File | Content |
+|---|---|
+| `douyin-1.png` | Cover: logo and main title |
+| `douyin-2.png` | Pain points: slow downloads, install failures, bulky emulators |
+| `douyin-3.png` | Four features |
+| `douyin-4.png` | ARM compatibility and Hongguo playback screenshot |
+| `douyin-5.png` | Package comparison, download QR codes, and creator handle |

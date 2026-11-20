@@ -1,33 +1,33 @@
-; ApkStart 自定义 NSIS 脚本
-; 作用：卸载开始前，先结束可能仍在后台驻留的运行时进程，
-; 否则它们会锁住安装目录里的文件，导致卸载不干净、第三方粉碎工具也删不掉。
+; ApkStart custom NSIS script
+; Stop any runtime processes that may still be running before uninstall begins,
+; otherwise, they can lock installation files and prevent a clean uninstall.
 ;
-; ApkStart 退出后仍可能留下 detached 的 qemu（为了下次秒开），
-; 所以卸载环节必须自己兜底清一遍。
+; A detached QEMU process may remain after ApkStart exits for a faster next launch,
+; so the uninstaller must stop it as a fallback.
 
-; 安装收尾：再兜一层桌面图标。
-; electron-builder 的 createDesktopShortcut 走的是它自己的 CreateShortcuts 流程，
-; 个别环境（桌面被 OneDrive 重定向、快捷方式被安全软件回滚）里会生成失败，
-; 用户装完发现桌面上什么都没有。这里用 NSIS 原生的 CreateShortcut 再写一次：
-; $DESKTOP 走 SHGetFolderPath，能正确跟随桌面的重定向路径；写成幂等操作，
-; 和 electron-builder 的重复执行也只是覆盖同一个 .lnk。
+; Create desktop shortcuts as a final installation fallback.
+; electron-builder createDesktopShortcut uses its own CreateShortcuts flow.
+; It may fail in some environments (for example, redirected desktops or security software undoing the shortcut),
+; leaving the user without a desktop icon. Create it again using the native NSIS CreateShortcut command.
+; $DESKTOP uses SHGetFolderPath and follows redirected desktop paths. This is idempotent,
+; so it safely overwrites the same .lnk if electron-builder already created it.
 !macro customInstall
-  DetailPrint "正在创建桌面快捷方式…"
+  DetailPrint "Creating desktop shortcuts..."
   CreateShortcut "$DESKTOP\ApkStart.lnk" "$INSTDIR\ApkStart.exe" "" "$INSTDIR\ApkStart.exe" 0 \
-    SW_SHOWNORMAL "" "ApkStart — 在电脑上直接运行安卓应用"
+    SW_SHOWNORMAL "" "ApkStart — Run Android apps directly on your PC"
   CreateDirectory "$SMPROGRAMS\ApkStart"
   CreateShortcut "$SMPROGRAMS\ApkStart\ApkStart.lnk" "$INSTDIR\ApkStart.exe" "" "$INSTDIR\ApkStart.exe" 0 \
-    SW_SHOWNORMAL "" "ApkStart — 在电脑上直接运行安卓应用"
+    SW_SHOWNORMAL "" "ApkStart — Run Android apps directly on your PC"
 !macroend
 
 !macro customUnInstall
-  ; 先删自己写的快捷方式入口（未安装 ApkStart 时也应无残留）
+  ; Remove our shortcuts too, leaving no residue if ApkStart is already absent.
   Delete "$DESKTOP\ApkStart.lnk"
   Delete "$SMPROGRAMS\ApkStart\ApkStart.lnk"
   RMDir "$SMPROGRAMS\ApkStart"
 
-  DetailPrint "正在结束 ApkStart 残留进程…"
-  ; /F 强杀 /T 连带子进程。进程不存在时 taskkill 返回 128，忽略即可。
+  DetailPrint "Stopping leftover ApkStart processes..."
+  ; /F forces termination and /T includes child processes. Ignore taskkill status 128 when a process is absent.
   nsExec::Exec 'taskkill.exe /F /T /IM ApkStart.exe'
   nsExec::Exec 'taskkill.exe /F /T /IM qemu-system-x86_64.exe'
   nsExec::Exec 'taskkill.exe /F /T /IM qemu-system-i386.exe'
@@ -35,6 +35,6 @@
   nsExec::Exec 'taskkill.exe /F /T /IM emulator-check.exe'
   nsExec::Exec 'taskkill.exe /F /T /IM adb.exe'
   nsExec::Exec 'taskkill.exe /F /T /IM netsimd.exe'
-  ; 给一点时间让进程真正退出、释放文件句柄
+  ; Allow processes time to exit and release file handles
   Sleep 1500
 !macroend

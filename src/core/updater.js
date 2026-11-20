@@ -1,56 +1,43 @@
 'use strict';
 /**
- * 在线更新：从 GitHub Releases（RoutineMiku/apkstart）取最新版本，下载并原地替换。
+ * Self-updater (`Updater`): checks GitHub & Gitee Releases, downloads single or split
+ * `.part1..N` release payloads with multi-mirror acceleration, and applies in-place updates
+ * for both NSIS (`Setup.exe /S`) and Portable (`portable.zip`) installations.
  *
- * 三个形态都要照顾到：
- *   - 安装版（NSIS）：下载 `ApkStart-x.y.z-Setup.exe`，静默安装（/S）；
- *   - 轻量版（便携 zip，运行时按需下载）：下载 `ApkStart-vX-win64-portable.zip`，
- *     解压后覆盖程序目录 —— 运行时目录（%APPDATA%\apkstart\runtime）与已装应用、
- *     快照全都在用户目录里，替换程序文件不会动它们；
- *   - 完整版（便携但带 runtime）：同轻量版，只是目录里多了 resources\runtime。
- *
- * 替换不能在本进程里做（exe 正被占用），所以生成一段 PowerShell 脚本，
- * 用 EncodedCommand 交给独立进程：等本进程退出 → 复制文件 → 重新拉起。
- * 用 base64 传脚本而不是写 .ps1 文件，是为了绕开「路径含中文时脚本被按 GBK 解码」
- * 这类老问题（PowerShell 5.1 读无 BOM 脚本会按 ANSI 解释）。
+ * Security & reliability invariants:
+ *   - Asset filenames are sanitized via `path.basename` before joining local paths;
+ *   - `_extract` enforces strict path-boundary containment (`destAbs + path.sep`) against Zip-Slip;
+ *   - Portable replacement retries `Copy-Item -ErrorAction Stop` inside `try/catch` so locked
+ *     executables/DLLs never cause a half-copied installation to be treated as successful.
  */
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { downloadAnyParallel, downloadMulti } = require('./download');
+const { downloadMulti } = require('./download');
 const { ZipFile } = require('./zip');
 const { cmpVer } = require('./version');
-const { Sources } = require('./sources');
+const { Sources, REPOS } = require('./sources');
 
-const OWNER = 'RoutineMiku';
-const REPO = 'apkstart';
-
-/** PowerShell 单引号字符串：内部的 ' 要写成 '' */
-function psq(s) {
-  return `'${String(s).replace(/'/g, "''")}'`;
-}
+function psq(s) { return `'${String(s).replace(/'/g, "''")}'`; }
 
 class Updater {
-  /**
-   * @param {{currentVersion:string, exePath:string, isPackaged:boolean, dataDir:string,
-   *          onProgress?:Function}} o
-   */
-  constructor(o) {
-    this.current = o.currentVersion || '0.0.0';
-    this.exePath = o.exePath;
-    this.installDir = path.dirname(o.exePath || '');
-    this.isPackaged = !!o.isPackaged;
-    this.dataDir = o.dataDir;
-    this.onProgress = o.onProgress || (() => {});
-    this.settings = typeof o.settings === 'function' ? o.settings : () => (o.settings || {});
-    // settings() 给 sources 用：决定「走 GitHub 还是 Gitee」「有没有镜像前缀」
-    this.sources = new Sources(this.settings);
-    this.latest = null;
-    this._last = null;
+  constructor(opts) {
+    this.currentVersion = opts.currentVersion || '0.0.0';
+    this.exePath = opts.exePath;
+    this.installDir = path.dirname(opts.exePath);
+    this.isPackaged = !!opts.isPackaged;
+    this.dataDir = opts.dataDir;
+    this.onProgress = opts.onProgress || (() => {});
+    this.sources = new Sources(opts.settings);
+    this._ctrl = null;
+    this._lastCheck = null;
+    this._connectionsOverride = 0;
   }
 
-  /** 安装形态：安装版（有卸载器）还是便携包 */
+  static repoUrl() { return REPOS.github.web; }
+
   get flavor() {
+    if (!this.isPackaged) return 'dev';
     try {
       const un = fs.readdirSync(this.installDir).find((n) => /^Uninstall .*\.exe$/i.test(n));
       if (un) return 'setup';
@@ -58,281 +45,319 @@ class Updater {
     return 'portable';
   }
 
-  get updateDir() {
-    return path.join(this.dataDir, 'update');
+  _pickAsset(assets) {
+    const appOnly = (assets || []).filter((a) => !/runtime/i.test(a.name));
+    const setup = appOnly.find((a) => /Setup\.exe$/i.test(a.name));
+    const portable = appOnly.find((a) => /portable.*\.zip$/i.test(a.name))
+      || appOnly.find((a) => /\.zip$/i.test(a.name));
+    return this.flavor === 'setup' ? (setup || portable) : (portable || setup);
   }
 
-  /**
-   * 检查更新：GitHub / Gitee 并发问，取版本号更高的，资产取并集。
-   * 具体下载地址在 prepare() 里再做一次真实测速排序。
-   */
-  /**
-   * @param {{force?:boolean}} [opts] force=true 时跳过 10 分钟的版本缓存
-   *        （用户主动点「检查更新」应该拿到最新结果；启动时的静默检查走缓存）
-   */
-  async check(opts = {}) {
-    const merged = await this.sources.latest({ force: !!opts.force });
-    const pick = (re) => merged.assets.find((a) => re.test(String(a.name || '')));
-    // 发行版里同时挂着「便携包」和「运行时整包」（ApkStart-runtime-*.zip）。
-    // 兜底的 .zip 匹配必须把运行时整包排除掉：某次发布如果只有运行时整包、
-    // 没有便携包，旧逻辑会把它当更新包解压进程序目录（多出 1.5GB 文件、程序也被换坏）。
-    const isRuntimePack = (a) => /runtime/i.test(String((a && a.name) || ''));
+  async check({ force = false } = {}) {
+    const merged = await this.sources.latest({ force });
+    const hasUpdate = cmpVer(merged.version, this.currentVersion) > 0;
+    const chosen = this._pickAsset(merged.assets);
 
-    const wantSetup = this.flavor === 'setup';
-    const asset = wantSetup
-      ? (pick(/Setup\.exe$/i) || merged.assets.find((a) => /\.exe$/i.test(a.name) && !isRuntimePack(a)))
-      : (pick(/portable.*\.zip$/i) || pick(/win64.*\.zip$/i)
-        || merged.assets.find((a) => /\.zip$/i.test(a.name) && !isRuntimePack(a)));
+    let asset = null;
+    if (chosen) {
+      const fullSize = (chosen.sizes && chosen.url && chosen.sizes[chosen.url]) || chosen.size || 0;
+      asset = {
+        name: path.basename(chosen.name),
+        size: fullSize,
+        sizes: chosen.sizes || {},
+        url: chosen.url,
+        urls: chosen.urls || [],
+        parts: chosen.parts || null,
+        sources: chosen.sources || [],
+      };
+    }
 
-    this.latest = {
+    const playable = !!(asset && ((asset.urls && asset.urls.length) || asset.url || asset.parts));
+    const info = {
+      current: this.currentVersion,
       version: merged.version,
       tag: merged.tag,
       name: merged.name,
       notes: merged.notes,
       htmlUrl: merged.htmlUrl,
       publishedAt: merged.publishedAt,
-      // 注意带上 parts：Gitee 的分片包没有单一 url，丢掉 parts 就变成「有资产但没地址」
-      asset: asset
-        ? {
-          name: asset.name,
-          size: asset.size,
-          url: asset.url,
-          // 同名资产在 GitHub / Gitee 都有：两个地址都带着，prepare() 里测速择快。
-          // sizes 是「每个地址各自的大小」——两个源压出来的字节数并不相同。
-          urls: asset.urls,
-          sizes: asset.sizes,
-          source: asset.source,
-          parts: asset.parts,
-          partial: asset.partial,
-        }
-        : null,
-      assets: merged.assets,
-      // 两个源各自的最新版本 / 谁不可达，界面上可以如实显示「这次走的哪个源」
+      hasUpdate,
+      flavor: this.flavor,
       sources: merged.sources,
       unreachable: merged.unreachable,
-      flavor: this.flavor,
-      hasUpdate: cmpVer(merged.tag, this.current) > 0,
-      current: this.current,
-      canAutoApply: !!asset && (!!asset.url || !!(asset.parts && asset.parts.length)),
+      stale: !!merged.stale,
+      canAutoApply: this.isPackaged && playable,
+      asset,
     };
-    this._last = this.latest;
-    return this.latest;
+    this._lastCheck = info;
+    return info;
   }
 
-  /**
-   * 下载并准备好「载荷」：便携版解压到 update/<ver>/payload，安装版直接留 Setup.exe。
-   * @returns {Promise<{mode:'zip'|'setup', payload:string, version:string}>}
-   */
-  async prepare(info) {
-    const it = info || this.latest;
-    if (!it || !it.asset) throw new Error('这个版本没有可自动安装的安装包，请到 GitHub 发布页手动下载');
-    const dir = path.join(this.updateDir, it.version);
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, it.asset.name);
-    let total = it.asset.size || 0;
-    const conns = Math.max(1, Math.min(16, Number((this.settings().runtime || {}).downloadConnections) || 8));
+  async download(asset, options = {}) {
+    this.onProgress = options.onProgress || this.onProgress;
+    const requestedConnections = Number(options.connections);
+    this._connectionsOverride = Number.isFinite(requestedConnections) && requestedConnections > 0
+      ? Math.max(1, Math.min(16, requestedConnections))
+      : 0;
+    const info = asset && asset.asset
+      ? asset
+      : {
+        version: (asset && (asset.version || asset.tag)) || 'latest',
+        hasUpdate: true,
+        asset,
+      };
+    try {
+      return await this.prepare(info, { signal: options.signal });
+    } finally {
+      this._connectionsOverride = 0;
+    }
+  }
 
-    // Gitee 附件单文件上限 100MB，所以发布时会把包切成 .part1/.part2。
-    // 每个分片单独测速选源（可以一部分来自 Gitee、一部分来自 GitHub 镜像），
-    // 下完按顺序拼回整包 —— 对用户来说仍然只是「下载 + 解压」。
-    if (it.asset.parts && it.asset.parts.length) {
-      await this._downloadParts(it.asset, file, conns, total);
-    } else {
-      this.onProgress({ stage: 'download', percent: 1, message: `正在下载 ${it.asset.name}…` });
-      // 候选地址 = 源站 + 镜像前缀；先各下 256KB 实测速度，再拿最快的那个分块下载。
-      // 这是「GitHub 直连几十 KB/s、镜像能跑几 MB/s」时唯一靠谱的选路方式：
-      // 按域名猜没用，同一天不同时段差别很大。
-      const cands = this.sources.candidates(it.asset);
-      const ranked = await this.sources.rank(cands, { onProgress: (p) => this.onProgress(p) }).catch(() => cands);
-      // 进度用的总大小要取「真正在下那个源」的：GitHub 与 Gitee 的包不是同一份字节
-      // （压缩器不同，能差好几 MB），拿错就会一直显示 92% 再突然跳到完成。
-      const sizes = it.asset.sizes || {};
-      for (const u of ranked) {
-        if (sizes[u]) { total = sizes[u]; break; }
-      }
-      // downloadMulti：分块同时从「GitHub 直连」和「镜像」拉，带宽叠加；
-      // 只有一个源可用或对方不支持 Range 时，它自己退回单源分块。
+  cancel() {
+    if (this._ctrl) { this._ctrl.abort(); this._ctrl = null; }
+  }
+
+  _connections() {
+    if (this._connectionsOverride) return this._connectionsOverride;
+    const s = (this.sources.getSettings() || {}).runtime || {};
+    return Math.max(1, Math.min(16, Number(s.downloadConnections) || 8));
+  }
+
+  async prepare(info, { signal } = {}) {
+    const it = info || this._lastCheck || (await this.check());
+    if (!it.hasUpdate) throw new Error('ApkStart is already up to date');
+    if (!it.asset) throw new Error('No automatic installer asset is attached to this release; please download manually.');
+
+    const dir = path.join(this.dataDir, 'update', it.version);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    const safeAssetName = path.basename(it.asset.name);
+    const file = path.join(dir, safeAssetName);
+
+    this._ctrl = new AbortController();
+    if (signal) {
+      if (signal.aborted) this._ctrl.abort();
+      else signal.addEventListener('abort', () => this._ctrl && this._ctrl.abort(), { once: true });
+    }
+    const conns = this._connections();
+    const totalHint = it.asset.size || 0;
+
+    if ((it.asset.urls && it.asset.urls.length) || it.asset.url) {
+      this.onProgress({ stage: 'probe', percent: 0, message: 'Benchmarking fastest download mirror...' });
+      const ranked = await this.sources.rank(this.sources.candidates(it.asset));
+      if (!ranked.length) throw new Error('No reachable download URLs available');
+      const expectSize = (it.asset.sizes && it.asset.sizes[ranked[0]]) || 0;
+
       await downloadMulti(ranked, file, {
         connections: conns,
+        signal: this._ctrl.signal,
+        onProgress: (p) => this.onProgress({
+          stage: 'download',
+          percent: p.percent ?? (totalHint ? Math.min(99, Math.round((p.received / totalHint) * 100)) : 0),
+          received: p.received,
+          total: p.total || totalHint,
+          speed: p.speed,
+          connections: p.connections,
+          sources: p.sources,
+          message: `Downloading update (${p.sources > 1 ? `${p.sources} mirrors · ` : ''}${p.connections || 1} threads)...`,
+        }),
+      });
+      if (expectSize > 0 && fs.statSync(file).size !== expectSize) {
+        throw new Error('Downloaded update archive is incomplete; please check your connection and retry.');
+      }
+    } else if (it.asset.parts && it.asset.parts.length) {
+      await this._downloadParts(it.asset, file, conns, totalHint);
+    } else {
+      throw new Error('Release asset has no valid download URL');
+    }
+    this._ctrl = null;
+
+    if (/\.exe$/i.test(safeAssetName)) {
+      return { mode: 'setup', installer: file, version: it.version };
+    }
+
+    this.onProgress({ stage: 'extract', percent: 100, message: 'Extracting update package...' });
+    const extracted = path.join(dir, 'payload');
+    await this._extract(file, extracted);
+    try { fs.unlinkSync(file); } catch (_) { /* ignore */ }
+
+    const root = this._locatePayloadRoot(extracted);
+    if (!fs.existsSync(path.join(root, 'ApkStart.exe'))) {
+      throw new Error('Extracted update package does not contain ApkStart.exe; aborting replacement.');
+    }
+    return { mode: 'portable', payloadDir: root, workDir: dir, version: it.version };
+  }
+
+  async _downloadParts(asset, outFile, conns, totalHint) {
+    const parts = asset.parts;
+    const tmpDir = `${outFile}.parts`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+    let doneBytes = 0;
+
+    const firstRanked = await this.sources.rank(this.sources.candidates({ urls: parts[0].urls }));
+    const order = (urls) => {
+      const cands = this.sources.candidates({ urls });
+      if (!firstRanked.length) return cands;
+      let winnerOrigin = '';
+      try { winnerOrigin = new URL(firstRanked[0]).origin; } catch (_) { /* ignore */ }
+      return cands.sort((a, b) => {
+        const wa = winnerOrigin && a.startsWith(winnerOrigin) ? 0 : 1;
+        const wb = winnerOrigin && b.startsWith(winnerOrigin) ? 0 : 1;
+        return wa - wb;
+      });
+    };
+
+    const partFiles = [];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      const pf = path.join(tmpDir, `part${p.index}`);
+      const urls = i === 0 ? firstRanked : order(p.urls);
+      // eslint-disable-next-line no-await-in-loop
+      await downloadMulti(urls, pf, {
+        connections: conns,
+        signal: this._ctrl ? this._ctrl.signal : undefined,
         onProgress: (pr) => {
-          const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
-          const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
-          const sp = Number(pr.speed) > 0 ? ` · ${(pr.speed / 1048576).toFixed(2)} MB/s` : '';
+          const cur = doneBytes + (pr.received || 0);
+          const pct = totalHint
+            ? Math.min(99, Math.round((cur / totalHint) * 100))
+            : Math.min(99, Math.round(((i + (pr.percent || 0) / 100) / parts.length) * 100));
           this.onProgress({
             stage: 'download',
-            percent: Math.max(1, Math.min(99, pct)),
-            message: `下载中 ${mb}${sp}`,
+            percent: pct,
+            received: cur,
+            total: totalHint,
             speed: pr.speed,
+            message: `Downloading part ${i + 1}/${parts.length}...`,
           });
         },
       });
-    }
-
-    if (/\.zip$/i.test(file)) {
-      const out = path.join(dir, 'payload');
-      fs.rmSync(out, { recursive: true, force: true });
-      fs.mkdirSync(out, { recursive: true });
-      await this._extract(file, out);
-      this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压完成' });
-      return { mode: 'zip', payload: out, version: it.version };
-    }
-    this.onProgress({ stage: 'ready', percent: 100, message: '安装包已下载完成' });
-    return { mode: 'setup', payload: file, version: it.version };
-  }
-
-  /**
-   * 下载并拼装分片包。
-   * @param {{name:string, size:number, parts:Array<{index:number,size:number,urls:string[]}>}} asset
-   */
-  async _downloadParts(asset, target, conns, total) {
-    const dir = path.dirname(target);
-    let doneBytes = 0;
-    const fd = fs.openSync(target, 'w');
-    try {
-      for (const part of asset.parts) {
-        const tmp = path.join(dir, `${asset.name}.${part.index}.tmp`);
-        const cands = [];
-        for (const u of part.urls) {
-          for (const c of this.sources.candidates(u)) if (!cands.includes(c)) cands.push(c);
-        }
-        // eslint-disable-next-line no-await-in-loop
-        const ranked = await this.sources.rank(cands, {
-          onProgress: (p) => this.onProgress({ ...p, percent: Math.max(1, Math.min(99, Math.round((doneBytes / (total || 1)) * 100))) }),
-        }).catch(() => cands);
-        // eslint-disable-next-line no-await-in-loop
-        await downloadAnyParallel(ranked, tmp, {
-          connections: conns,
-          onProgress: (pr) => {
-            const got = doneBytes + (pr.got || 0);
-            const pct = total ? Math.round((got / total) * 100) : 0;
-            const sp = Number(pr.speed) > 0 ? ` · ${(pr.speed / 1048576).toFixed(2)} MB/s` : '';
-            this.onProgress({
-              stage: 'download',
-              percent: Math.max(1, Math.min(99, pct)),
-              message: `下载中 ${(got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`
-                + `（第 ${part.index}/${asset.parts.length} 片）${sp}`,
-              speed: pr.speed,
-            });
-          },
-        });
-        const buf = fs.readFileSync(tmp);
-        if (part.size && buf.length !== part.size) {
-          throw new Error(`分片 ${part.index} 大小不对（${buf.length} ≠ ${part.size}），已中止，可重试`);
-        }
-        fs.writeSync(fd, buf, 0, buf.length, doneBytes);
-        doneBytes += buf.length;
-        fs.rmSync(tmp, { force: true });
+      const got = fs.statSync(pf).size;
+      if (p.size && got !== p.size) {
+        throw new Error(`Part ${i + 1} size mismatch (${got}/${p.size})`);
       }
-    } finally {
-      fs.closeSync(fd);
+      doneBytes += got;
+      partFiles.push(pf);
     }
-    if (total && doneBytes !== total) {
-      throw new Error(`更新包拼装后大小不对（${doneBytes} ≠ ${total}），已中止，可重试`);
+
+    this.onProgress({ stage: 'extract', percent: 99, message: 'Joining split archive parts...' });
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(outFile);
+      out.on('error', reject);
+      out.on('finish', resolve);
+      (async () => {
+        for (const pf of partFiles) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((res, rej) => {
+            const r = fs.createReadStream(pf);
+            r.on('error', rej);
+            r.on('end', res);
+            r.pipe(out, { end: false });
+          });
+          try { fs.unlinkSync(pf); } catch (_) { /* ignore */ }
+        }
+        out.end();
+      })().catch((e) => { out.destroy(); reject(e); });
+    });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (asset.size && fs.statSync(outFile).size !== asset.size) {
+      throw new Error('Assembled archive size does not match manifest');
     }
   }
 
   async _extract(zipPath, dest) {
+    const destAbs = path.resolve(dest);
+    fs.mkdirSync(destAbs, { recursive: true });
     const zf = new ZipFile(zipPath);
     try {
-      const names = zf.names().filter((n) => !n.endsWith('/'));
-      let i = 0;
-      for (const n of names) {
-        i += 1;
-        const target = path.join(dest, n.replace(/\\/g, '/'));
-        if (!target.startsWith(path.resolve(dest))) continue;   // 防 zip-slip
+      const names = zf.names();
+      for (let i = 0; i < names.length; i++) {
+        const n = names[i];
+        if (!n || n.endsWith('/')) continue;
+        const target = path.resolve(destAbs, n.replace(/\\/g, '/'));
+        if (target !== destAbs && !target.startsWith(destAbs + path.sep)) continue;
         fs.mkdirSync(path.dirname(target), { recursive: true });
+        // eslint-disable-next-line no-await-in-loop
         await zf.pipeTo(n, fs.createWriteStream(target));
-        if (i % 20 === 0) {
-          this.onProgress({
-            stage: 'extract',
-            percent: Math.min(99, Math.round((i / names.length) * 100)),
-            message: `正在解压 ${i}/${names.length}`,
-          });
-        }
       }
     } finally {
-      try { zf.close(); } catch (_) { /* ignore */ }
+      zf.close();
     }
   }
 
-  /**
-   * 生成并启动「替换 + 重启」脚本，然后调用方负责退出应用。
-   * @param {{mode:'zip'|'setup', payload:string, version:string}} job
-   * @param {{waitPid?:number, spawn?:boolean}} [opts] 测试时可指定别的 pid / 不真启动
-   */
-  apply(job, opts = {}) {
-    const exe = this.exePath;
-    const dir = this.installDir;
-    const logFile = path.join(this.updateDir, 'update.log');
-    fs.mkdirSync(this.updateDir, { recursive: true });
-    const waitPid = opts.waitPid || process.pid;
+  _locatePayloadRoot(dir) {
+    if (fs.existsSync(path.join(dir, 'ApkStart.exe'))) return dir;
+    for (const sub of fs.readdirSync(dir)) {
+      const p = path.join(dir, sub);
+      try {
+        if (fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, 'ApkStart.exe'))) return p;
+      } catch (_) { /* ignore */ }
+    }
+    return dir;
+  }
 
-    const lines = [
-      `$ErrorActionPreference = 'SilentlyContinue'`,
-      `$log = ${psq(logFile)}`,
-      `function Note($m) { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
-      `Note 'updater start'`,
-      // 等本进程真正退出（最多 90 秒），否则 exe/dll 仍被占用
-      `try { Wait-Process -Id ${waitPid} -Timeout 90 } catch { }`,
-      `Start-Sleep -Milliseconds 700`,
+  applyAndRestart(job, onRestart) {
+    const result = this.apply(job);
+    if (typeof onRestart === 'function') setTimeout(onRestart, 250).unref?.();
+    return result;
+  }
+
+  apply(job) {
+    const log = path.join(this.dataDir, 'logs', 'updater.log');
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    const script = path.join(this.dataDir, 'update', 'apply.ps1');
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+
+    const header = [
+      '$ErrorActionPreference = "SilentlyContinue"',
+      `$pid0 = ${process.pid}`,
+      `$exe  = ${psq(this.exePath)}`,
+      `$dst  = ${psq(this.installDir)}`,
+      `$log  = ${psq(log)}`,
+      'function Note($m) { Add-Content -LiteralPath $log -Value ("[" + (Get-Date -Format o) + "] " + $m) }',
+      'Note "waiting for main process $pid0"',
+      'for ($i = 0; $i -lt 90; $i++) {',
+      '  if (-not (Get-Process -Id $pid0 -ErrorAction SilentlyContinue)) { break }',
+      '  Start-Sleep -Milliseconds 500',
+      '}',
+      'Start-Sleep -Milliseconds 600',
     ];
 
-    if (job.mode === 'zip') {
-      lines.push(
-        `$src = ${psq(job.payload)}`,
-        `$dst = ${psq(dir)}`,
-        `$ok = $false`,
-        `for ($i = 1; $i -le 12; $i++) {`,
-        `  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
-        `  $probe = Join-Path $dst ${psq(path.basename(exe))}`,
-        `  if (Test-Path $probe) { $ok = $true; Note "copy pass $i ok"; break }`,
-        `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 600`,
-        `}`,
-        `if (-not $ok) { Note 'copy failed' }`,
-        // 新版本里已经删掉的文件不会因为覆盖而消失，但保留它们无害；
-        // 只清掉本次的解压目录，避免白占几百 MB。
-        `Remove-Item -Path $src -Recurse -Force`,
-      );
-    } else {
-      lines.push(
-        `Note 'run installer'`,
-        `$p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait`,
-        `Note ("installer exit " + $p.ExitCode)`,
-        `Start-Sleep -Milliseconds 800`,
-      );
-    }
+    const body = job.mode === 'setup'
+      ? [
+        `$inst = ${psq(job.installer)}`,
+        'Note "running NSIS installer $inst"',
+        `$p = Start-Process -FilePath $inst -ArgumentList '/S', ('/D=' + $dst) -Wait -PassThru`,
+        'Note ("installer exit=" + $p.ExitCode)',
+        'Remove-Item -LiteralPath $inst -Force',
+        'Start-Process -FilePath $exe',
+      ]
+      : [
+        `$src  = ${psq(job.payloadDir)}`,
+        `$work = ${psq(job.workDir)}`,
+        'Note "copying portable payload $src -> $dst"',
+        '$ok = $false',
+        'for ($i = 1; $i -le 15; $i++) {',
+        '  try {',
+        '    Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force -ErrorAction Stop',
+        '    $ok = $true; Note "copy pass $i ok"; break',
+        '  } catch {',
+        '    Note ("copy pass $i locked/failed: " + $_.Exception.Message)',
+        '    Start-Sleep -Milliseconds 700',
+        '  }',
+        '}',
+        'if ($ok) { Remove-Item -LiteralPath $work -Recurse -Force }',
+        'Start-Process -FilePath $exe',
+      ];
 
-    lines.push(
-      `if (Test-Path ${psq(exe)}) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
-      `Note 'updater done'`,
-      `Start-Sleep -Milliseconds 400`,
-      `Remove-Item -Path ${psq(path.join(this.updateDir, job.version))} -Recurse -Force`,
-      // 收尾的清理语句失败（目录已被删/被杀软占用）不应该让调用方以为更新失败
-      `exit 0`,
-    );
+    fs.writeFileSync(script, '\ufeff' + [...header, ...body, 'Note "done"', ''].join('\r\n'), 'utf8');
 
-    const script = lines.join('\r\n');
-    fs.writeFileSync(path.join(this.updateDir, 'apply.log.ps1'), script, 'utf8');
-    if (opts.spawn === false) return script;
-    // -EncodedCommand 走 UTF-16LE base64：脚本里出现中文路径也不会被 GBK 解码搞坏
-    const b64 = Buffer.from(script, 'utf16le').toString('base64');
-    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    // 这里**不能**用 detached：某些安全软件 / 沙箱策略会直接拦掉「分离的控制台进程」，
-    // 表现为脚本一声不响地根本没跑（更新界面卡在「正在替换程序并重启」）。
-    // Windows 上父进程退出并不会杀掉普通子进程，所以用「普通子进程 + unref」同样能在
-    // 我们退出之后继续干活，兼容性还更好。
-    const child = spawn(ps, [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-WindowStyle', 'Hidden', '-EncodedCommand', b64,
-    ], { stdio: 'ignore', windowsHide: true });
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+      '-File', script,
+    ], { detached: true, stdio: 'ignore', windowsHide: true });
     child.unref();
-    return true;
-  }
-
-  /** 打不开 UI 的场景（或没有可自动安装的资产）时，把发布页丢给浏览器 */
-  static repoUrl() {
-    return `https://github.com/${OWNER}/${REPO}/releases`;
+    return { ok: true, script, log };
   }
 }
 
-module.exports = { Updater, cmpVer, OWNER, REPO };
+module.exports = { Updater, cmpVer };

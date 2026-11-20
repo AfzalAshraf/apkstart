@@ -1,136 +1,99 @@
 'use strict';
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
-
-const invoke = (channel, payload) => ipcRenderer.invoke(channel, payload);
+const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('apkstart', {
-  info: () => invoke('app:info'),
-  listApps: () => invoke('apps:list'),
-  pickApk: () => invoke('apk:pick'),
-  parseApk: (p) => invoke('apk:parse', p),
-  installApk: (p) => invoke('apk:install', p),
-  launch: (pkg) => invoke('app:launch', pkg),
-  uninstall: (pkg) => invoke('app:uninstall', pkg),
-  createShortcut: (pkg) => invoke('app:shortcut', pkg),
-  clearData: (pkg) => invoke('app:clearData', pkg),
-  pin: (pkg, pinned) => invoke('app:pin', { pkg, pinned }),
-  revealApk: (pkg) => invoke('app:revealApk', pkg),
-  revealApkDir: () => invoke('apk:reveal'),
-  openDir: () => invoke('dialog:openDir'),
+  getState: () => ipcRenderer.invoke('state:get'),
+  saveSettings: (patch) => ipcRenderer.invoke('settings:save', patch),
+  pickApk: () => ipcRenderer.invoke('dialog:pickApk'),
+  pickAdb: () => ipcRenderer.invoke('dialog:pickAdb'),
+  pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
+  pickIso: () => ipcRenderer.invoke('dialog:pickIso'),
 
-  getSettings: () => invoke('settings:get'),
-  setSettings: (patch) => invoke('settings:set', patch),
-  restoreSystemApps: () => invoke('settings:restoreSystem'),
-  refreshPointerMapping: () => invoke('settings:refreshPointer'),
-  restoreMouseHook: () => invoke('settings:unhook'),
+  installApk: (apkPath) => ipcRenderer.invoke('apk:install', apkPath),
+  inspectApk: (apkPath) => ipcRenderer.invoke('apk:inspect', apkPath),
+  launchApp: (pkg) => ipcRenderer.invoke('app:launch', pkg),
+  stopApp: (pkg) => ipcRenderer.invoke('app:stop', pkg),
+  uninstallApp: (pkg, fromDevice) => ipcRenderer.invoke('app:uninstall', pkg, fromDevice),
+  createShortcut: (pkg) => ipcRenderer.invoke('app:shortcut', pkg),
+  rebuildShortcuts: () => ipcRenderer.invoke('app:rebuildShortcuts'),
+  clearAppData: (pkg) => ipcRenderer.invoke('app:clearData', pkg),
 
-  runtimeStatus: () => invoke('runtime:status'),
-  runtimeProbe: () => invoke('runtime:probe'),
-  runtimeStart: () => invoke('runtime:start'),
-  runtimeStop: () => invoke('runtime:stop'),
-  runtimeLog: () => invoke('runtime:log'),
-  doctorProfile: () => invoke('doctor:profile'),
-  doctorReport: () => invoke('doctor:report'),
-  vcRedist: () => invoke('runtime:vcRedist'),
-  installVcRedist: () => invoke('runtime:installVcRedist'),
-  runtimeUsage: () => invoke('runtime:usage'),
-  runtimeCleanup: (opts) => invoke('runtime:cleanup', opts || {}),
-  runtimeResetData: () => invoke('runtime:resetData'),
-  runtimeRepairNetwork: () => invoke('runtime:repairNetwork'),
-  runtimeCheckNetwork: () => invoke('runtime:checkNetwork'),
-  leftoversScan: () => invoke('leftovers:scan'),
-  leftoversClean: (items) => invoke('leftovers:clean', items),
-  startupInfo: () => invoke('app:startupInfo'),
-  dataInfo: () => invoke('runtime:dataInfo'),
-  setDataSize: (gb) => invoke('runtime:setDataSize', gb),
-  confirm: (opts) => invoke('app:confirm', opts || {}),
-  displayState: () => invoke('display:state'),
-  displaySet: (patch) => invoke('display:set', patch || {}),
-  displayToggle: () => invoke('display:toggle'),
-  rebuildShortcuts: () => invoke('shortcut:rebuild'),
-  autoDeploy: () => invoke('runtime:autoDeploy'),
-  startInstaller: () => invoke('runtime:startInstaller'),
-  markInstalled: () => invoke('runtime:markInstalled'),
-  resetInstall: () => invoke('runtime:resetInstall'),
+  ensureRuntime: () => ipcRenderer.invoke('runtime:ensure'),
+  stopRuntime: () => ipcRenderer.invoke('runtime:stop'),
+  engineStatus: () => ipcRenderer.invoke('engine:status'),
+  provisionStatus: () => ipcRenderer.invoke('provision:status'),
+  provisionDeploy: () => ipcRenderer.invoke('provision:deploy'),
+  provisionCancel: () => ipcRenderer.invoke('provision:cancel'),
+  provisionReset: () => ipcRenderer.invoke('provision:reset'),
+  importIso: (p) => ipcRenderer.invoke('provision:importIso', p),
+  sourcesProbe: () => ipcRenderer.invoke('sources:probe'),
+  layersAnalyze: () => ipcRenderer.invoke('layers:analyze'),
+  layersPrune: () => ipcRenderer.invoke('layers:prune'),
+  layersVerify: () => ipcRenderer.invoke('layers:verify'),
 
-  provisionCheck: () => invoke('provision:check'),
-  provisionProbeSources: () => invoke('provision:probeSources'),
-  installAdb: () => invoke('provision:installAdb'),
-  installQemu: () => invoke('provision:installQemu'),
-  installEmulator: () => invoke('provision:installEmulator'),
-  installSysimg: () => invoke('provision:installSysimg'),
-  installPlayImage: () => invoke('provision:installPlayImage'),
-  installAehd: () => invoke('provision:installAehd'),
-  enableAccel: () => invoke('provision:enableAccel'),
-  enableVirtualization: () => invoke('provision:enableVirtualization'),
-  downloadIso: () => invoke('provision:downloadIso'),
-  createDisk: (gb) => invoke('provision:createDisk', gb),
-  importIso: () => invoke('provision:importIso'),
-  importDisk: () => invoke('provision:importDisk'),
+  doctorCheck: () => ipcRenderer.invoke('doctor:check'),
+  doctorExport: () => ipcRenderer.invoke('doctor:export'),
+  doctorSelfCheck: () => ipcRenderer.invoke('doctor:selfCheck'),
+  clearLocks: () => ipcRenderer.invoke('app:clearLocks'),
 
-  selfCheck: () => invoke('doctor:selfCheck'),
-  clearLocks: () => invoke('app:clearLocks'),
-  removeSelf: () => invoke('app:removeSelf'),
-  setSharedDir: (dir) => invoke('settings:setSharedDir', dir),
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateApply: (asset) => ipcRenderer.invoke('update:apply', asset),
+  updateCancel: () => ipcRenderer.invoke('update:cancel'),
 
-  // 在线更新（GitHub Releases）
-  updateCheck: (opts) => invoke('app:updateCheck', opts || {}),
-  updateApply: () => invoke('app:updateApply'),
-  updateCancel: () => invoke('app:updateCancel'),
-  updateOpenRelease: (url) => invoke('app:updateOpen', url),
-  restartApp: () => invoke('app:restart'),
+  leftoversScan: () => ipcRenderer.invoke('leftovers:scan'),
+  leftoversClean: (items) => ipcRenderer.invoke('leftovers:clean', items),
+  removeSelf: (opts) => ipcRenderer.invoke('app:removeSelf', opts),
 
-  assocStatus: () => invoke('assoc:status'),
-  assocRegister: () => invoke('assoc:register'),
-  assocUnregister: () => invoke('assoc:unregister'),
+  androidStatus: () => ipcRenderer.invoke('android:status'),
+  androidWifi: (on) => ipcRenderer.invoke('android:wifi', on),
+  androidAirplane: (on) => ipcRenderer.invoke('android:airplane', on),
+  androidVolume: (v) => ipcRenderer.invoke('android:volume', v),
+  androidAnimations: (on) => ipcRenderer.invoke('android:animations', on),
+  androidFontScale: (s) => ipcRenderer.invoke('android:fontScale', s),
+  androidDensity: (d) => ipcRenderer.invoke('android:density', d),
+  androidTune: (pkg) => ipcRenderer.invoke('android:tune', pkg),
+  androidOpen: (a) => ipcRenderer.invoke('android:open', a),
+  androidPermissions: (pkg) => ipcRenderer.invoke('android:permissions', pkg),
+  androidGrantAll: (pkg) => ipcRenderer.invoke('android:grantAll', pkg),
 
-  syncShared: () => invoke('share:sync'),
-  openSharedDir: () => invoke('share:open'),
+  displaySet: (patch) => ipcRenderer.invoke('display:set', patch),
+  displayFullscreen: () => ipcRenderer.invoke('display:fullscreen'),
+  displayWindow: () => ipcRenderer.invoke('display:window'),
 
-  openExternal: (url) => invoke('shell:open', url),
-  winMinimize: () => invoke('window:minimize'),
-  winMaximize: () => invoke('window:maximize'),
-  winClose: () => invoke('window:close'),
-  winHide: () => invoke('window:hide'),
-  bringAppToFront: () => invoke('app:foreground'),
-
-  // 应用窗口（只有 旋转 / 最小化 / 最大化 / 关闭）用到的接口
-  shell: {
-    state: () => invoke('shell:state'),
-    minimize: () => invoke('shell:minimize'),
-    maximize: () => invoke('shell:maximize'),
-    close: () => invoke('shell:close'),
-    rotate: () => invoke('shell:rotate'),
-    back: () => invoke('shell:back'),
-    forward: () => invoke('shell:forward'),
-    onState: (cb) => {
-      const handler = (_e, payload) => cb(payload);
-      ipcRenderer.on('shell:state', handler);
-      return () => ipcRenderer.removeListener('shell:state', handler);
-    },
+  shellReady: () => ipcRenderer.invoke('shell:ready'),
+  shellRotate: () => ipcRenderer.invoke('shell:rotate'),
+  shellMin: () => ipcRenderer.invoke('shell:min'),
+  shellMax: () => ipcRenderer.invoke('shell:max'),
+  shellClose: () => ipcRenderer.invoke('shell:close'),
+  onShellState: (fn) => {
+    const h = (_e, d) => fn(d);
+    ipcRenderer.on('shell:state', h);
+    return () => ipcRenderer.removeListener('shell:state', h);
   },
 
-  // 安卓系统设置（WiFi / 音量 / 显示 / 动画 / 权限 …）
-  android: {
-    status: () => invoke('android:status'),
-    set: (key, value) => invoke('android:set', { key, value }),
-    open: (action) => invoke('android:open', action),
-    tune: (pkg) => invoke('android:tune', pkg),
-    permissions: (pkg) => invoke('android:permissions', pkg),
-    grantAll: (pkg) => invoke('android:grantAll', pkg),
+  shareOpenLocal: () => ipcRenderer.invoke('share:openLocal'),
+  shareSyncNow: () => ipcRenderer.invoke('share:syncNow'),
+  sharePushFile: () => ipcRenderer.invoke('share:pushFile'),
+
+  registerAssociation: () => ipcRenderer.invoke('assoc:register'),
+  unregisterAssociation: () => ipcRenderer.invoke('assoc:unregister'),
+  openDataDir: () => ipcRenderer.invoke('app:openData'),
+  openExternal: (url) => ipcRenderer.invoke('shell:external', url),
+  openPath: (targetPath) => ipcRenderer.invoke('shell:openPath', targetPath),
+
+  onProgress: (fn) => {
+    const h = (_e, d) => fn(d);
+    ipcRenderer.on('progress', h);
+    return () => ipcRenderer.removeListener('progress', h);
   },
-
-  pathForFile: (file) => webUtils.getPathForFile(file),
-
-  on: (channel, cb) => {
-    const allowed = [
-      'install:start', 'install:progress', 'install:done', 'install:error',
-      'app:launched', 'runtime:log', 'toast', 'ui:navigate', 'provision:progress',
-      'update:progress', 'update:state',
-    ];
-    if (!allowed.includes(channel)) return () => {};
-    const handler = (_e, payload) => cb(payload);
-    ipcRenderer.on(channel, handler);
-    return () => ipcRenderer.removeListener(channel, handler);
+  onStateChange: (fn) => {
+    const h = (_e, d) => fn(d);
+    ipcRenderer.on('state:changed', h);
+    return () => ipcRenderer.removeListener('state:changed', h);
+  },
+  onDeployAsk: (fn) => {
+    const h = (_e, d) => fn(d);
+    ipcRenderer.on('deploy:ask', h);
+    return () => ipcRenderer.removeListener('deploy:ask', h);
   },
 });

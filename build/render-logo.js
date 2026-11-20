@@ -1,10 +1,10 @@
 'use strict';
 /**
- * Logo 渲染：用 Electron 离屏渲染 build/logo.html → 多尺寸 PNG + ICO
+ * Render build/logo.html with Electron and export multi-size PNG and ICO files.
  *   node_modules/electron/dist/electron.exe build/render-logo.js
- * 产出：src/ui/assets/logo.png（512，供界面/窗口图标）
- *       build/appicon.ico（16~256 多尺寸，供 .apk 关联与快捷方式）
- *       docs/images/logo.png（README 用）
+ * Outputs: src/ui/assets/logo.png (512 px, UI and window icon)
+ *          build/appicon.ico (16–256 px, APK association and shortcuts)
+ *          docs/images/logo.png (README)
  */
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');

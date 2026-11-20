@@ -1,55 +1,79 @@
-# 贡献指南
+# Contributing to ApkStart
 
-欢迎提交 Issue 和 Pull Request。这个项目的原则是**壳层零依赖、行为可预测**，所以请先读一下下面的约定。
+Issues and pull requests are welcome. ApkStart aims for predictable behavior, a small renderer, and explicit runtime/process boundaries. Please read the relevant sections below before changing those contracts.
 
-## 开发环境
+## Development setup
 
-- Windows 10/11 x64
-- Node.js ≥ 20
-- `npm install && npm start`
-
-## 提交前自检
+- Windows 10 or 11, x64 is the supported development target.
+- Node.js 20 or newer and npm are required.
+- Install dependencies and run the regression suite:
 
 ```powershell
-npm test          # 纯 Node 单元测试 + 引擎链路测试（不需要网络、不需要虚拟机）
+npm ci
+npm test
 ```
 
-涉及界面改动时，建议再跑一次冒烟截图确认没有布局塌陷：
+To launch the application during development, use `npm start`. Runtime provisioning may download large Android components on first use.
+
+## Before submitting
+
+- Run the smallest relevant test while iterating, then run `npm test`.
+- For renderer or IPC changes, verify preload channels, main handlers, HTML selectors, and linked assets.
+- For UI changes, run the Electron application on Windows and attach a screenshot or describe the smoke scenario when practical.
+- For Win32, PowerShell, display, or emulator-window changes, state which Windows version and emulator build were tested. Do not present static checks as an end-to-end pass.
+- Keep generated builds, runtime binaries, AVDs, APKs, private logs, and credentials out of the patch.
+
+## Code conventions
+
+- Keep maintained comments, user-facing text, tests, and operational messages in English.
+- The renderer is plain HTML/CSS/JavaScript; do not introduce a framework for a small interaction.
+- Route Android operations through `src/core/adb.js`; avoid constructing ad hoc ADB invocations in unrelated modules.
+- Keep `contextIsolation` enabled and `nodeIntegration` disabled. Add renderer capabilities through narrow named methods in `src/preload.js`, not a generic IPC or shell bridge.
+- Preserve compatibility aliases when a public export is used by the main process, scripts, tests, or other core modules. Search all call sites before removing one.
+- Prefer synthetic test fixtures for binary formats. Do not commit proprietary or user-supplied APKs.
+- Validate untrusted paths and values at process boundaries; archive extraction must not escape the destination directory.
+
+## Windows-specific invariants
+
+- Preserve the UTF-8 BOM in `src/core/win/agent.ps1`; it is required by the embedded PowerShell/C# compilation path.
+- Keep `src/core/win/windowctl.ps1` ASCII-only.
+- The Win32 agent must be scoped to ApkStart runtime processes and must never hide or re-parent unrelated application windows.
+- Park/detach the emulator surface and remove input hooks during cleanup. Do not reintroduce `SetWindowRgn` clipping for the embedded surface.
+- A landscape/display change must preserve physical LCD profile, Android orientation, touch coordinates, and the host window layout together.
+
+## Tests
+
+The default suite is local and does not require a real APK or network access:
 
 ```powershell
-electron . --smoke test\shot.png
+npm test
 ```
 
-## 代码约定
-
-- **壳层不引入第三方运行时依赖**。`src/core/` 下的 ZIP / AXML / ARSC / PNG / ICO 解析都是手写的，
-  新增功能时优先考虑「能不能用 Node 内置模块写完」，避免为了小功能拉进一个大包。
-- 渲染层是原生 HTML/CSS/JS，不使用前端框架。
-- 与安卓侧交互一律走 `src/core/adb.js`，不要在各处直接拼 adb 命令。
-- 主进程与渲染进程之间只通过 `preload.js` 暴露的白名单通道通信，保持 `contextIsolation` 开启。
-- 注释与 UI 文案使用中文，标识符使用英文。
-
-## 测试约定
-
-- 拿不到真实 APK 时测试会自动跳过 APK 解析部分；要覆盖这部分，设置环境变量指向任意 APK：
+To include an optional real APK fixture for parser validation:
 
 ```powershell
-$env:APKSTART_TEST_APK="C:\path\to\any.apk"; npm test
+$env:APKSTART_TEST_APK = 'C:\path\to\test.apk'
+npm test
+Remove-Item Env:APKSTART_TEST_APK
 ```
 
-- 不要在测试里访问外网。需要网络行为的测试请起本地 `http` 服务（参考 `test/engine-test.js`）。
+Do not add that fixture to the repository. Tests that need network behavior should use a local HTTP server. Tests that need Windows APIs or a real Android runtime must be clearly marked opt-in and must isolate settings, data directories, and child processes.
 
-## 提交信息
+## Commit messages
 
-使用 Conventional Commits 风格，例如：
+Use Conventional Commit-style messages, for example:
 
+```text
+fix(apk): handle aliased launcher activities
+fix(ui): align renderer selectors with shell markup
+ test(runtime): cover interrupted image materialization
+docs: refresh runtime lifecycle guide
 ```
-feat(engine): 支持从自定义路径导入 qcow2 磁盘
-fix(axml): 修正属性表基址偏移
-docs: 补充 WHPX 开启说明
-```
 
-## 法律与边界
+(Do not include the leading space in a commit subject.)
 
-- 本项目不分发任何安卓系统镜像、QEMU 二进制或 Google 组件，全部由用户本机按需下载。
-- 请勿在仓库中提交商业 APK、破解工具或任何侵犯第三方版权的内容。
+## Licensing and safety
+
+- Do not add Android system images, emulator binaries, Google components, commercial APKs, cracked software, or other content you are not authorized to redistribute.
+- Do not include tokens, credentials, personal paths, or private user data in source, tests, logs, screenshots, or documentation.
+- Destructive reset, cleanup, and release operations require an isolated target and explicit task authorization.

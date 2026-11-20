@@ -1,9 +1,15 @@
 'use strict';
 /**
- * 安卓系统设置：不需要进安卓桌面，也不用装第三方工具，
- * 直接通过 adb 把常用的系统开关做成 ApkStart 设置页里的按钮。
- * 所有命令都是官方 shell 接口，不依赖 root。
+ * Android guest system settings controller (`AndroidSettings`).
+ *
+ * Exposes Wi-Fi, Airplane Mode, Media Volume (scaled 0-100% <-> Android STREAM_MUSIC 0..max),
+ * System Animations, Font Scale, Display Density (DPI), 1-Click Smoothness Tuning, and
+ * Runtime Permissions directly inside ApkStart Settings without needing root or Android Launcher.
  */
+const { assertSafePkg, shQuote } = require('./adb');
+
+const SAFE_PERM = /^[A-Za-z0-9_.]+$/;
+
 const ACTIONS = {
   settings: 'android.settings.SETTINGS',
   wifi: 'android.settings.WIFI_SETTINGS',
@@ -23,7 +29,7 @@ class AndroidSettings {
 
   async client() {
     const rt = await this.runtime.ensure();
-    if (!rt.ok) throw new Error(rt.error || '运行时未就绪');
+    if (!rt.ok) throw new Error(rt.error || 'Android runtime is not ready');
     return rt.client;
   }
 
@@ -33,7 +39,6 @@ class AndroidSettings {
     return c.shell(script, { timeout: 20000 });
   }
 
-  /** 读一批当前状态，供设置页显示 */
   async status() {
     const out = await this._sh([
       'echo "wifi=$(settings get global wifi_on)"',
@@ -42,19 +47,31 @@ class AndroidSettings {
       'echo "density=$(wm density | tail -n1 | tr -dc \'0-9\')"',
       'echo "animw=$(settings get global window_animation_scale)"',
       'echo "sdk=$(getprop ro.build.version.sdk)"',
-      'echo "vol=$(dumpsys audio | grep -m1 -A3 STREAM_MUSIC | grep -o \'streamVolume:[0-9]*\' | head -1 | cut -d: -f2)"',
+      'echo "volcur=$(dumpsys audio | grep -m1 -A6 \'^- STREAM_MUSIC:\' | grep -o \'streamVolume:[0-9]*\\|Current:[^\\n]*\' | head -1)"',
+      'echo "volmax=$(dumpsys audio | grep -m1 -A4 \'^- STREAM_MUSIC:\' | grep -o \'Max: *[0-9]*\' | head -1 | tr -dc \'0-9\')"',
     ]);
     const get = (k) => {
       const m = new RegExp(`${k}=([^\\r\\n]*)`).exec(String(out));
       return m ? m[1].trim() : '';
     };
     const anim = get('animw');
+    const maxIdx = Math.max(1, Number(get('volmax')) || 15);
+    const curRaw = get('volcur');
+    let curIdx = Number((/streamVolume:(\d+)/.exec(curRaw) || [])[1]);
+    if (!Number.isFinite(curIdx)) {
+      const m2 = /(?:\(speaker\)|default|2):\s*(\d+)/i.exec(curRaw) || /(\d+)\s*$/.exec(curRaw);
+      curIdx = m2 ? Number(m2[1]) : Math.round(maxIdx * 0.6);
+    }
+    const volumePct = Math.max(0, Math.min(100, Math.round((curIdx / maxIdx) * 100)));
+
     return {
       wifi: get('wifi') === '1',
       airplane: get('air') === '1',
       fontScale: Number(get('font')) || 1,
       density: Number(get('density')) || 0,
-      volume: Number(get('vol')) || 0,
+      volume: volumePct,
+      volumeIndex: curIdx,
+      volumeMax: maxIdx,
       animationsOff: anim === '0.0' || anim === '0',
       sdk: Number(get('sdk')) || 0,
     };
@@ -76,13 +93,23 @@ class AndroidSettings {
     return { ok: true };
   }
 
+  /**
+   * Set Android STREAM_MUSIC (stream 3) volume from a 0..100 UI percentage.
+   * Uses `cmd media_session volume` (Android 11-14+) with fallback to `media volume` (Android 9-10).
+   */
   async setVolume(percent) {
-    const v = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
-    await this._sh([`media volume --stream 3 --set ${v}`]);
-    return { ok: true, volume: v };
+    const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+    const maxOut = await this._sh([
+      'dumpsys audio | grep -m1 -A4 \'^- STREAM_MUSIC:\' | grep -o \'Max: *[0-9]*\' | head -1 | tr -dc \'0-9\'',
+    ]).catch(() => '');
+    const maxIdx = Math.max(1, Number(String(maxOut || '').trim()) || 15);
+    const idx = Math.max(0, Math.min(maxIdx, Math.round((pct / 100) * maxIdx)));
+    await this._sh([
+      `(cmd media_session volume --stream 3 --set ${idx} 2>/dev/null || media volume --stream 3 --set ${idx} 2>/dev/null || true)`,
+    ]);
+    return { ok: true, volume: pct, volumeIndex: idx, volumeMax: maxIdx };
   }
 
-  /** 关闭系统动画 = 明显的「变快」体感，且几乎不损失功能 */
   async setAnimations(on) {
     const v = on ? '1' : '0';
     await this._sh([
@@ -99,7 +126,6 @@ class AndroidSettings {
     return { ok: true, fontScale: Number(v) };
   }
 
-  /** 显示大小：改 dpi，越大内容越大（相当于系统「显示大小」档位） */
   async setDensity(dpi) {
     const v = Math.max(120, Math.min(640, Math.round(Number(dpi) || 0)));
     if (!v) return { ok: false };
@@ -107,7 +133,6 @@ class AndroidSettings {
     return { ok: true, density: v };
   }
 
-  /** 一键整理：关动画 + 关遥测类服务 + 电池白名单，让应用更跟手 */
   async tune({ pkg } = {}) {
     const cmds = [
       'settings put global window_animation_scale 0',
@@ -115,7 +140,10 @@ class AndroidSettings {
       'settings put global animator_duration_scale 0',
       'settings put global activity_manager_constants max_cached_processes=32',
     ];
-    if (pkg) cmds.push(`dumpsys deviceidle whitelist +${pkg}`);
+    if (pkg) {
+      const safe = assertSafePkg(pkg);
+      cmds.push(`dumpsys deviceidle whitelist +${shQuote(safe)}`);
+    }
     await this._sh(cmds);
     return { ok: true };
   }
@@ -127,10 +155,10 @@ class AndroidSettings {
     return { ok: true };
   }
 
-  /** 应用运行时权限一览 + 授权 */
   async permissions(pkg) {
+    const safe = assertSafePkg(pkg);
     const c = await this.client();
-    const dump = await c.shell(`dumpsys package ${pkg}`, { timeout: 20000 });
+    const dump = await c.shell(`dumpsys package ${shQuote(safe)}`, { timeout: 20000 });
     const lines = String(dump).split(/\r?\n/);
     let inRuntime = false;
     const rows = [];
@@ -145,12 +173,13 @@ class AndroidSettings {
   }
 
   async grantAll(pkg) {
+    const safe = assertSafePkg(pkg);
     const c = await this.client();
-    const rows = await this.permissions(pkg);
-    const denied = rows.filter((r) => !r.granted).map((r) => r.name);
+    const rows = await this.permissions(safe);
+    const denied = rows.filter((r) => !r.granted && SAFE_PERM.test(r.name)).map((r) => r.name);
     for (const p of denied) {
       // eslint-disable-next-line no-await-in-loop
-      await c.shell(`pm grant ${pkg} ${p}`, { timeout: 8000 }).catch(() => {});
+      await c.shell(`pm grant ${shQuote(safe)} ${shQuote(p)}`, { timeout: 8000 }).catch(() => {});
     }
     return { ok: true, granted: denied.length };
   }

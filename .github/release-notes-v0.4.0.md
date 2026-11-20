@@ -1,52 +1,52 @@
 # ApkStart v0.4.0
 
-> 一句话：修好「红果打不开 / 一直黑屏」这个回归，托盘单击就能开主界面，再压了一轮启动速度，并把运行期的杂窗统一压掉。
+> Fixes the Hongguo black-screen regression, opens the main window with one tray click, improves startup time, and hides stray runtime windows.
 
-## 一、修复：红果打不开 / 一直黑屏（v0.3.9 的回归）
+## 1. Fix: Hongguo would not open or stayed black (regression from v0.3.9)
 
-**原因**：上一版为了「等网络就绪再启动应用」，在启动流程里调了带**冷启动重试**的等待逻辑。网络慢的时候它会「停掉虚拟机 → 冷启动」，而应用启动正要 `adb install` / `am start` —— 设备在途中消失，于是：
+**Cause:** The previous release waited for the VM network using a helper that could cold-boot the VM again. When networking was slow, the helper stopped and restarted the VM while the app was running `adb install` or `am start`. The device disappeared mid-operation:
 
-```
+```text
 adb.exe: device 'emulator-5554' not found
 launch failed com.phoenix.read
 ```
 
-**修复**：
+**Fix:**
 
-- **启动路径上永远只等、不重启**：最多等 20 秒，等不到就先启动应用（页面慢一点没关系，不能直接失败）；
-- 冷启动/重置这类重活只在用户主动点「修复网络」时才做；
-- `waitForNetwork` 不再一看到 `device-offline` 就放弃 —— 刚重启的虚拟机有几十秒 adb 还没上线，现在给 45 秒宽限（之前的版本因此误判「修复失败」）。
+- On the app-launch path, only wait for networking; never restart the VM. Wait up to 20 seconds, then launch anyway. A slow page is preferable to a failed launch.
+- Reserve cold-boot and reset operations for the user-triggered **Repair network** action.
+- Do not treat `device-offline` as an immediate failure in `waitForNetwork`. A newly restarted VM may take time for adb to come online; allow a 45-second grace period.
 
-**同时把「修复网络」改对了**：实测这个镜像只有 `-wipe-data` 后的那次开机才稳定联网，所以现在直接重置数据（应用清单保留、点开自动重装），联网成功后**立刻存快照** —— 下次从快照恢复时网卡状态一起还原。
+Testing showed that this image connects reliably after `-wipe-data`. **Repair network** now resets Android data (the app list is preserved, and apps reinstall when launched), waits for network readiness, and immediately saves a snapshot so the connected state is restored next time.
 
-实测：修复后启动日志出现 `虚拟机网络就绪（10.0.2.16）`，点「同意并继续」进入 `MainFragmentActivity`，首页正常刷出剧集与推荐流。
+Reported test: startup logged `Android VM network ready (10.0.2.16)`; Hongguo opened `MainFragmentActivity` and rendered its episodes and recommendations.
 
-## 二、托盘：单击即可打开主界面
+## 2. Tray behavior
 
-之前只绑了双击，用户单击没反应会以为托盘图标坏了。现在单击直接打开主窗口（右键仍是菜单，双击照旧）。
+A single click now opens the main window. Right-click still opens the menu, and double-click continues to work.
 
-## 三、启动速度
+## 3. Startup time
 
-- 启动路径不再做冷启动重试，去掉了动辄 3~5 分钟的等待；
-- 网络等待从 60 秒降到 **20 秒**，且设备掉线时立刻返回而不是空转；
-- 修好网络后会存一份「网络正常」的快照，之后每次从快照恢复：实测完整启动（开机→联网→安装→嵌入）约 **48 秒**，其中开机约 20 秒。
+- Remove cold-boot retries from the app-launch path, avoiding waits of three to five minutes.
+- Reduce the network wait from 60 to **20 seconds** and return promptly if the device disconnects.
+- After network repair, save a network-ready snapshot. A reported full startup (boot, network, install, and embed) took about **48 seconds**, including a 20-second boot.
 
-## 四、运行期杂窗
+## 4. Stray runtime windows
 
-窗口代理新增一层兜底：把**属于我们运行时目录的进程**创建的所有多余可见顶层窗口统一隐藏（Qt 提示框、崩溃对话框、音量条、日志窗等），只保留要嵌进宿主的那一个模拟器主窗口。之前的实现是按类名逐个点名，漏一个就闪一次。
+Add a fallback in the window agent that hides extra visible top-level windows created by processes under our runtime directory (Qt dialogs, crash dialogs, volume bars, log windows, and similar), retaining the single emulator window to embed. The previous implementation named window classes individually and could miss new ones.
 
-## 五、工程加固
+## 5. Hardening
 
-- `agent.ps1` 重新带上 **UTF-8 BOM**。之前用普通方式保存会丢 BOM，PowerShell 5.1 按 ANSI 读中文注释，可能把注释和下一行代码并成一行导致 `Add-Type` 编译失败（表现就是「窗口代理启动失败 / 应用窗口不嵌入」）。
-- 新增回归测试：**窗口代理脚本必须带 UTF-8 BOM**，以后再丢会直接测试失败。
+- Restore the **UTF-8 BOM** in `agent.ps1`. Without it, Windows PowerShell 5.1 may decode UTF-8 Chinese comments as ANSI and combine a comment with the next line, causing `Add-Type` compilation to fail and preventing window embedding.
+- Add a regression test that fails if the BOM is removed.
 
-## 六、实测
+## 6. Reported validation
 
-- `npm test`：**114 项全部通过**（8 + 25 + 81）。
-- 红果：启动 → 同意 → 首页正常显示视频流（截图确认）。
-- 托盘单击可打开主界面。
+- `npm test`: **114 checks passed** (8 + 25 + 81).
+- Hongguo opened from consent to a normally rendered home feed (screenshot verified).
+- A single tray click opened the main window.
 
-## 七、升级方式
+## 7. Upgrade
 
-- 便携版：解压覆盖，数据目录（默认 `%APPDATA%\apkstart`）保持不变。
-- 安装版：直接安装覆盖。
+- Portable: extract over the existing app; keep the data directory (default `%APPDATA%\apkstart`).
+- Installer: install over the existing version.

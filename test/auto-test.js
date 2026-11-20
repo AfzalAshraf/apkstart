@@ -1,7 +1,7 @@
 'use strict';
 /**
- * 零配置自适应 / 容器式瘦身的回归测试（纯 Node，不拉起 emulator）
- * 运行：node test/auto-test.js
+ * Regression tests for zero-configuration tuning and lightweight app containers (Node only; does not launch an emulator)
+ * Run with: node test/auto-test.js
  */
 const fs = require('fs');
 const os = require('os');
@@ -19,7 +19,7 @@ function test(name, fn) {
     .then(() => { passed += 1; results.push(`  ✓ ${name}`); })
     .catch((e) => { failed += 1; results.push(`  ✗ ${name}\n    ${e.stack || e.message}`); });
 }
-function assert(c, m) { if (!c) throw new Error(m || '断言失败'); }
+function assert(c, m) { if (!c) throw new Error(m || 'Assertion failed'); }
 
 const doctor = require('../src/core/doctor');
 const layers = require('../src/core/layers');
@@ -27,82 +27,82 @@ const pointer = require('../src/core/pointer');
 const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src/core/adb');
 
 (async () => {
-  console.log('\n[doctor.js 自动参数]');
+  console.log('\n[doctor.js automatic settings]');
 
-  await test('GPU 后端按 emulator 版本选择（新版本 host 优先 + 软件渲染兜底，老版本 swiftshader_indirect）', () => {
-    // 新版本（37.x/36.4.9+）：host 最跟手，失败会自动降级到 software/swangle
-    assert(doctor.gpuCandidates('37.3.8.0')[0] === 'host', '37.x 首选应为 host');
+  await test('GPU backend selection follows the emulator version (host first on newer versions, software fallback, swiftshader_indirect on older versions)', () => {
+    // Newer versions (37.x / 36.4.9+): host is most responsive, with automatic fallback to software/swangle.
+    assert(doctor.gpuCandidates('37.3.8.0')[0] === 'host', 'host should be first choice on 37.x');
     assert(doctor.gpuCandidates('36.4.9.0')[0] === 'host');
-    assert(doctor.gpuCandidates('37.3.8.0').includes('software'), '新版本必须有软件渲染兜底');
-    // 37.x 上传 swiftshader_indirect 会 GL 初始化失败，绝不能出现在候选里
+    assert(doctor.gpuCandidates('37.3.8.0').includes('software'), 'Newer versions must include a software-rendering fallback');
+    // swiftshader_indirect fails GL initialization on 37.x and must not be a candidate.
     assert(!doctor.gpuCandidates('37.3.8.0').includes('swiftshader_indirect'));
-    // 老版本仍走 swiftshader_indirect
+    // Older versions still use swiftshader_indirect.
     assert(doctor.gpuCandidates('35.1.4.0')[0] === 'host');
     assert(doctor.gpuCandidates('35.1.4.0').includes('swiftshader_indirect'));
   });
 
-  await test('小内存机器自动降配（不再是写死 4GB / 4 核）', () => {
+  await test('Automatically tune settings for low-memory machines (no hard-coded 4 GB / 4 cores)', () => {
     const host = { totalMB: 4096, freeMB: 2600, cores: 2, home: 'C:\\Users\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
     const p = doctor.chooseProfile({ host, accel: { ok: false }, emulatorVersion: '37.3.8.0', diskMB: 20000, port: 5554, adbPort: 5044 });
-    assert(p.memoryMB === 2048, `内存应为 2048，实际 ${p.memoryMB}`);
-    assert(p.cores === 2, `核心应为 2，实际 ${p.cores}`);
-    assert(p.accel === 'off', '无硬件加速应自动回退软件模拟');
-    assert(p.bootTimeoutMs > 240000, '软件模拟应给更长的开机超时');
-    assert(p.gpu === 'host', `首选渲染应为 host（失败由 planVariants 降级），实际 ${p.gpu}`);
-    // accel 关闭时的保底参数必须是软件渲染，否则 TCG 下无 GPU 可用
+    assert(p.memoryMB === 2048, `Expected 2048 MB of memory; got ${p.memoryMB}`);
+    assert(p.cores === 2, `Expected 2 cores; got ${p.cores}`);
+    assert(p.accel === 'off', 'Without hardware acceleration, fall back to software emulation');
+    assert(p.bootTimeoutMs > 240000, 'Software emulation should have a longer boot timeout');
+    assert(p.gpu === 'host', `host should be the preferred renderer (planVariants handles fallback); got ${p.gpu}`);
+    // When acceleration is disabled, the final fallback must use software rendering; TCG has no usable GPU otherwise.
     const lastResort = doctor.planVariants(p).find((v) => v.lastResort);
-    assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
-    // 数据分区默认按磁盘余量给 4/6/8GB（不再写死 16G），且可以被设置覆盖
-    assert(p.dataMB >= 4096 && p.dataMB <= 8192, `数据分区应在 4~8GB，实际 ${p.dataMB}`);
+    assert(lastResort && /software|swiftshader/.test(lastResort.gpu), 'The last-resort plan must use software rendering');
+    // The data partition defaults to 4/6/8 GB based on available disk space (not a fixed 16 GB) and can be overridden in Settings.
+    assert(p.dataMB >= 4096 && p.dataMB <= 8192, `Expected a 4–8 GB data partition; got ${p.dataMB} MB`);
     const big = doctor.chooseProfile({
       host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000,
       settings: { engine: { dataPartitionGB: 24 } }, overrides: {},
     });
-    assert(big.dataMB === 24 * 1024, '设置里的数据分区容量必须生效');
+    assert(big.dataMB === 24 * 1024, 'The configured data-partition size must be applied');
   });
 
-  await test('大内存机器不会无限吃内存', () => {
+  await test('High-memory machines must not use unlimited memory', () => {
     const host = { totalMB: 65536, freeMB: 50000, cores: 32, home: 'C:\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
     const p = doctor.chooseProfile({ host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000, port: 5554, adbPort: 5044 });
-    assert(p.memoryMB <= 3072 && p.cores <= 4, `高配也应封顶：${p.memoryMB}MB / ${p.cores}核`);
+    assert(p.memoryMB <= 3072 && p.cores <= 4, `High-end systems should still be capped: ${p.memoryMB} MB / ${p.cores} cores`);
     assert(p.accel === 'auto');
   });
 
-  await test('重试矩阵：从最优到最保守，包含软件模拟与冷启动兜底', () => {
+  await test('Retry matrix proceeds from best to most conservative and includes software emulation and cold-boot fallback', () => {
     const p = doctor.chooseProfile({
       host: doctor.hostInfo(), accel: { ok: true }, emulatorVersion: '37.3.8.0',
       diskMB: 50000, port: 5554, adbPort: 5044,
     });
     const v = doctor.planVariants(p);
-    assert(v.length >= 3 && v.length <= 4, `重试次数应 3-4，实际 ${v.length}`);
-    assert(v.some((x) => x.accel === 'off'), '缺少软件模拟兜底');
-    // 最后一档只做「不加载快照 + 最小内存」，绝不允许 -wipe-data：
-    // 磁盘写满时每一档都会失败，带 wipe 的话会把用户已装应用一起清掉（实测踩过）。
-    assert(v[v.length - 1].snapshot === false, '最后一档必须跳过快照加载');
-    assert(v[v.length - 1].wipe === false, '任何自动重试都不允许清用户数据');
-    assert(v[v.length - 1].memoryMB <= 2048, '最后一档应降到最小内存');
+    assert(v.length >= 3 && v.length <= 4, `Expected 3–4 retries; got ${v.length}`);
+    assert(v.some((x) => x.accel === 'off'), 'Missing software-emulation fallback');
+    // The final retry only skips snapshot loading and uses minimum memory; never pass -wipe-data:
+    // When the disk is full, every retry fails. Adding wipe would also erase the user’s installed apps (this has happened in practice).
+    assert(v[v.length - 1].snapshot === false, 'The final retry must skip snapshot loading');
+    assert(v[v.length - 1].wipe === false, 'Automatic retries must never clear user data');
+    assert(v[v.length - 1].memoryMB <= 2048, 'The final retry should use minimum memory');
     const keys = v.map((x) => `${x.gpu}|${x.accel}|${x.wipe}|${x.memoryMB}|${x.snapshot !== false}`);
-    assert(new Set(keys).size === keys.length, '重试方案不应重复');
+    assert(new Set(keys).size === keys.length, 'Retry plans must be unique');
   });
 
-  await test('镜像换盘不算换镜像：sysdir 换了目录不该清用户数据', () => {
+  await test('Moving an image to another drive is not an image change: changing sysdir must not clear user data', () => {
     const c = 'C:/Users/x/AppData/Roaming/apkstart/system-images/android-34/google_apis_playstore/x86_64/';
     const d = 'D:/ApkStartRuntime/system-images/android-34/google_apis_playstore/x86_64/';
-    assert(doctor.imageIdentity(c) === doctor.imageIdentity(d), '同一套镜像的路径身份必须相同');
+    assert(doctor.imageIdentity(c) === doctor.imageIdentity(d), 'Paths to the same image must have the same identity');
     const key = (p) => doctor.snapshotKey({ emulatorVersion: '37.3.8', api: '34', tag: 'google_apis_playstore' }, p);
-    assert(key(c) === key(d), '换盘后快照不该作废（否则白等一次冷启动）');
+    assert(key(c) === key(d), 'Moving the image to another drive must not invalidate its snapshot (which would force an unnecessary cold boot)');
     const other = 'D:/rt/system-images/android-34/google_apis/x86_64/';
-    assert(doctor.imageIdentity(other) !== doctor.imageIdentity(d), '真的换了镜像必须能识别出来');
+    assert(doctor.imageIdentity(other) !== doctor.imageIdentity(d), 'A genuinely different image must be detected');
   });
 
-  await test('快照指纹不随 GPU/加速/内存重试变化（避免每次重试都清空已装应用）', () => {
+  await test('Snapshot fingerprints must ignore GPU, acceleration, and memory retries to avoid clearing installed apps on each retry', () => {
     const a = doctor.snapshotKey({ dataMB: 4096, emulatorVersion: '37.3.8.0', api: '34', tag: 'google_apis_playstore' }, 'C:\\img');
     const b = doctor.snapshotKey({ dataMB: 4096, emulatorVersion: '37.3.8.0', api: '34', tag: 'google_apis_playstore' }, 'C:\\img');
     const c = doctor.snapshotKey({ dataMB: 4096, emulatorVersion: '37.3.8.0', api: '34', tag: 'google_apis_playstore' }, 'C:\\img2');
     assert(a === b && a !== c);
   });
 
-  await test('日志诊断能识别显卡/加速/中文路径/锁文件问题', () => {
+  await test('Log diagnostics identify GPU, acceleration, non-ASCII path, and lock-file issues', () => {
     assert(doctor.diagnose(['Failed to initialize GL emulation']).code === 'GPU_INIT');
     assert(doctor.diagnose(['ERROR: x86_64 emulation currently requires hardware acceleration!']).code === 'ACCEL');
     assert(doctor.diagnose(['Cannot allocate memory for guest RAM']).code === 'MEMORY');
@@ -111,30 +111,30 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(['random line']).code === 'UNKNOWN');
   });
 
-  await test('日志诊断：emulator 以 0xC0000005 退出要判定为渲染后端崩溃', () => {
-    // 实测 issue #20/#25：打印完 Userspace boot properties 后 exit 3221225477
+  await test('Log diagnostics classify emulator exit 0xC0000005 as a renderer crash', () => {
+    // Observed in issues #20/#25: the emulator exited with 3221225477 after printing Userspace boot properties.
     assert(doctor.diagnose(['emulator exit 3221225477']).code === 'ACCESS_VIOLATION');
     assert(doctor.diagnose(['... 0xC0000005 ...']).code === 'ACCESS_VIOLATION');
-    // 崩溃日志里通常也带着渲染初始化信息：必须优先判崩溃，而不是 GPU_INIT
+    // Crash logs often include renderer initialization messages; prioritize the crash diagnosis over GPU_INIT.
     const mixed = ['Graphics backend: gfxstream', 'emulator exit 3221225477'];
-    assert(doctor.diagnose(mixed).code === 'ACCESS_VIOLATION', '崩溃应优先于普通渲染日志');
+    assert(doctor.diagnose(mixed).code === 'ACCESS_VIOLATION', 'A crash should take precedence over ordinary renderer logs');
   });
 
-  await test('空闲端口探测返回偶数端口对', async () => {
+  await test('Free-port detection returns an even-numbered port pair', async () => {
     const p = await doctor.freePortPair(5560);
-    assert(p % 2 === 0 && p >= 5560, `端口异常：${p}`);
+    assert(p % 2 === 0 && p >= 5560, `Unexpected port: ${p}`);
   });
 
-  await test('设置页展示的自动参数与实跑参数一致（37.x 不再显示弃用后端）', () => {
+  await test('Automatic settings shown in the UI match runtime settings (37.x no longer shows a deprecated backend)', () => {
     const common = { accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 50000, port: 5562, adbPort: 5044 };
     const p = doctor.autoProfile({ ...common, settings: { engine: { autoMemory: true, gpuMode: 'auto', memoryMB: 0, cores: 0 } } });
     const text = doctor.describeProfile(p);
-    assert(p.gpu === 'host', `应为 host（失败降级），实际 ${p.gpu}`);
-    assert(p.accelOk === true && text.includes('硬件加速'), text);
+    assert(p.gpu === 'host', `Expected host (with fallback on failure); got ${p.gpu}`);
+    assert(p.accelOk === true && text.includes('Hardware acceleration'), text);
     assert(!text.includes('swiftshader_indirect'), text);
-    assert(text.includes('端口 5562'), text);
+    assert(text.includes('Port 5562'), text);
 
-    // 老引擎仍应用老后端；用户手动填的高级参数仍然生效
+    // Older engines retain their legacy backend; manually configured advanced settings still apply.
     const old = doctor.autoProfile({ ...common, emulatorVersion: '35.1.4.0', settings: {} });
     assert(old.gpu === 'host' && doctor.gpuCandidates('35.1.4.0').includes('swiftshader_indirect'));
     const manual = doctor.autoProfile({ ...common, settings: { engine: { autoMemory: false, memoryMB: 6144, cores: 6, gpuMode: 'swiftshader' } } });
@@ -143,9 +143,9 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(zero.memoryMB === 0 && zero.cores === 0 && zero.gpuMode === '', JSON.stringify(zero));
   });
 
-  console.log('\n[layers.js 容器式瘦身]');
+  console.log('\n[layers.js runtime cleanup]');
 
-  await test('盘点可回收项：非 x86_64 QEMU、旧镜像、旧 AVD、锁文件、旧快照', () => {
+  await test('Identify reclaimable files: non-x86_64 QEMU, old images, old AVDs, lock files, and stale snapshots', () => {
     const root = path.join(TMP, 'runtime-layers');
     const mk = (p, size) => {
       fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -165,40 +165,40 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
 
     const a = layers.analyze(root);
     const paths = a.candidates.map((c) => c.path.replace(/\\/g, '/'));
-    assert(paths.some((p) => p.endsWith('qemu-system-aarch64.exe')), '应列出非 x86_64 QEMU');
-    assert(!paths.some((p) => p.endsWith('qemu-system-x86_64.exe')), '不能删 x86_64 QEMU');
-    assert(paths.some((p) => p.includes('android-30')), '应列出旧版 API30 镜像');
-    assert(paths.some((p) => p.endsWith('.lock')), '应列出锁文件');
-    assert(paths.some((p) => p.includes('snapshots')), '应列出旧快照');
-    assert(paths.some((p) => p.includes('apkstart-arm.avd')), '应列出非活动 AVD');
-    assert(!paths.some((p) => p.endsWith('apkstart.avd/config.ini')), '不能删活动 AVD 配置');
+    assert(paths.some((p) => p.endsWith('qemu-system-aarch64.exe')), 'Expected non-x86_64 QEMU to be listed');
+    assert(!paths.some((p) => p.endsWith('qemu-system-x86_64.exe')), 'Must not delete x86_64 QEMU');
+    assert(paths.some((p) => p.includes('android-30')), 'Expected the old API 30 image to be listed');
+    assert(paths.some((p) => p.endsWith('.lock')), 'Expected lock files to be listed');
+    assert(paths.some((p) => p.includes('snapshots')), 'Expected stale snapshots to be listed');
+    assert(paths.some((p) => p.includes('apkstart-arm.avd')), 'Expected inactive AVDs to be listed');
+    assert(!paths.some((p) => p.endsWith('apkstart.avd/config.ini')), 'Must not delete the active AVD configuration');
 
     const dry = layers.prune(root, { apply: false });
-    assert(dry.removed.length === 0 && dry.saved === 0, 'dryRun 不应删除任何文件');
+    assert(dry.removed.length === 0 && dry.saved === 0, 'Dry run must not delete files');
     assert(fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd', 'userdata-qemu.img')));
 
     const done = layers.prune(root, { apply: true });
-    assert(done.saved > 0 && done.removed.length >= 5, '实际清理应释放空间');
-    assert(!fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd')), '非活动 AVD 应被清掉');
-    assert(fs.existsSync(path.join(root, 'avd', 'apkstart.avd', 'config.ini')), '活动 AVD 必须保留');
-    assert(fs.existsSync(path.join(root, 'emulator', 'qemu', 'windows-x86_64', 'qemu-system-x86_64.exe')), 'x86_64 QEMU 必须保留');
+    assert(done.saved > 0 && done.removed.length >= 5, 'Applying cleanup should reclaim space');
+    assert(!fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd')), 'Inactive AVD should be removed');
+    assert(fs.existsSync(path.join(root, 'avd', 'apkstart.avd', 'config.ini')), 'The active AVD must be preserved');
+    assert(fs.existsSync(path.join(root, 'emulator', 'qemu', 'windows-x86_64', 'qemu-system-x86_64.exe')), 'x86_64 QEMU must be preserved');
   });
 
-  console.log('\n[adb.js 安装/启动失败可读性]');
+  console.log('\n[adb.js readable install and launch errors]');
 
-  await test('Android 14 老 targetSdk 应用失败有明确指引', () => {
+  await test('Show clear guidance when an app with an old targetSdk fails on Android 14', () => {
     const s = friendlyInstallError('Failure [INSTALL_FAILED_DEPRECATED_SDK_VERSION: app must target at least 23]');
-    assert(s.includes('Android 14') && s.includes('自动'), s);
+    assert(s.includes('Android 14') && s.includes('automatically'), s);
   });
 
-  await test('ARM 翻译层崩溃能给出可执行的中文结论', () => {
+  await test('ARM translation-layer crashes produce actionable guidance', () => {
     const s = friendlyLaunchError('F DEBUG: DoBadTrampoline libndk_translation SIGABRT', 'com.phoenix.read');
-    assert(s.includes('ARM 翻译层') && s.includes('兼容镜像'), s);
+    assert(s.includes('ARM translation layer') && s.includes('ARM-compatible system image'), s);
   });
 
-  console.log('\n[sharer 不再来回搬运（磁盘写满的元凶）]');
+  console.log('\n[sharer avoids repeated transfers (a cause of full disks)]');
 
-  await test('同一个文件不会每轮都被从设备拉回来', async () => {
+  await test('Do not pull the same file from the device on every sync', async () => {
     const { Sharer } = require('../src/core/sharer');
     const localDir = path.join(TMP, 'shared');
     fs.mkdirSync(localDir, { recursive: true });
@@ -216,22 +216,22 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     };
     const sh = new Sharer({ client: () => fakeClient });
     sh.localDirOverride = localDir;
-    // 用真实的路径/状态文件，但目录指向临时目录
+    // Use the real path/state-file logic, but point it to a temporary directory.
     Object.defineProperty(sh, 'localDir', { get: () => localDir });
     Object.defineProperty(sh, 'remoteDir', { get: () => '/sdcard/x' });
     sh.stateFile = path.join(TMP, 'shared-state.json');
 
-    await sh.sync();          // 第 1 轮：本机新文件 → 推上去
+    await sh.sync();          // Round 1: push a new local file to the device
     const firstPull = calls.pull;
-    await sh.sync();          // 第 2 轮
-    await sh.sync();          // 第 3 轮
-    await sh.sync();          // 第 4 轮
-    assert(calls.push === 1, `只应推送一次，实际 ${calls.push}`);
-    assert(firstPull === 0, `刚推上去的文件不该立刻被拉回来，实际拉取 ${firstPull} 次`);
-    assert(calls.pull === firstPull, `后续轮次不应再反复拉取，实际累计 ${calls.pull} 次`);
+    await sh.sync();          // Round 2
+    await sh.sync();          // Round 3
+    await sh.sync();          // Round 4
+    assert(calls.push === 1, `Expected one push; got ${calls.push}`);
+    assert(firstPull === 0, `A newly pushed file must not be pulled back immediately; got ${firstPull} pulls`);
+    assert(calls.pull === firstPull, `Later syncs must not pull it repeatedly; total pulls: ${calls.pull}`);
   });
 
-  await test('超大文件不会被反向拉回本机（本地目录不是设备缓存下水道）', async () => {
+  await test('Very large files must not be pulled back to the PC (the local folder is not a device-cache dump)', async () => {
     const { Sharer } = require('../src/core/sharer');
     const localDir = path.join(TMP, 'shared2');
     fs.mkdirSync(localDir, { recursive: true });
@@ -249,25 +249,25 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     Object.defineProperty(sh, 'remoteDir', { get: () => '/sdcard/x' });
     sh.stateFile = path.join(TMP, 'shared-state2.json');
     await sh.sync();
-    assert(pulled === 0, '超过 512MB 的文件不应拉回本机');
+    assert(pulled === 0, 'Files larger than 512 MB must not be pulled to the PC');
   });
 
-  console.log('\n[adb/sharer 文件互通]');
+  console.log('\n[adb/sharer file sharing]');
 
-  await test('ls -l 解析兼容 Android 的含 group / 日期格式', async () => {
+  await test('Parse Android ls -l output, including group and date fields', async () => {
     const { AdbClient } = require('../src/core/adb');
     const fake = Object.create(AdbClient.prototype);
     fake.shell = async () => '-rw-rw---- 1 u0_a188 media_rw 12 2026-11-12 18:52 hello.txt\r\n'
       + 'drwxrwx--- 2 u0_a188 media_rw 4096 2026-11-12 18:52 sub\r\n'
       + '-rw-rw---- 1 u0_a188 7 Nov 12 18:52 no-group.txt\r\n';
     const rows = await fake.listRemote('/sdcard/x');
-    assert(rows.length === 3, `应解析 3 行，实际 ${rows.length}`);
+    assert(rows.length === 3, `Expected 3 rows; got ${rows.length}`);
     assert(rows[0].name === 'hello.txt' && rows[0].size === 12, JSON.stringify(rows[0]));
     assert(rows[1].isDir && rows[1].name === 'sub', JSON.stringify(rows[1]));
     assert(rows[2].name === 'no-group.txt' && rows[2].size === 7, JSON.stringify(rows[2]));
   });
 
-  await test('远端文件列表可用 find+stat 一次拿全（不依赖 ls 日期解析）', async () => {
+  await test('Retrieve the remote file list in one find+stat call (without parsing ls dates)', async () => {
     const { Sharer } = require('../src/core/sharer');
     const sh = Object.create(Sharer.prototype);
     const fake = {
@@ -275,13 +275,13 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       listRemote: async () => [],
     };
     const rows = await sh.listRemoteRecursive(fake, '/sdcard/x');
-    assert(rows.length === 2, `应返回 2 个文件，实际 ${rows.length}`);
+    assert(rows.length === 2, `Expected 2 files; got ${rows.length}`);
     assert(rows[1].rel === 'sub/b.txt' && rows[1].mtime > 1e12, JSON.stringify(rows[1]));
   });
 
-  console.log('\n[zip.js 大包流式解压]');
+  console.log('\n[zip.js streaming extraction for large archives]');
 
-  await test('ZipFile 与 ZipArchive 对同一压缩包的解析结果一致（含 deflate 与流式 pipeTo）', async () => {
+  await test('ZipFile and ZipArchive parse the same archive consistently, including deflate and streaming pipeTo', async () => {
     const zlib = require('zlib');
     const { ZipArchive, ZipFile } = require('../src/core/zip');
     const entries = [
@@ -328,22 +328,22 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const mem = new ZipArchive(buf);
     const file = new ZipFile(zipPath);
     try {
-      assert(mem.names().join('|') === file.names().join('|'), '条目名应一致');
-      assert(mem.read('a.txt').equals(file.read('a.txt')), 'stored 条目内容应一致');
-      assert(mem.read('dir/b.bin').equals(file.read('dir/b.bin')), 'deflate 条目内容应一致');
+      assert(mem.names().join('|') === file.names().join('|'), 'Entry names should match');
+      assert(mem.read('a.txt').equals(file.read('a.txt')), 'Stored entry contents should match');
+      assert(mem.read('dir/b.bin').equals(file.read('dir/b.bin')), 'Deflate entry contents should match');
       const out = path.join(TMP, 'b.bin');
       await file.pipeTo('dir/b.bin', fs.createWriteStream(out));
-      assert(fs.readFileSync(out).equals(entries[1].data), 'pipeTo 流式输出应完整');
+      assert(fs.readFileSync(out).equals(entries[1].data), 'pipeTo streaming output should be complete');
     } finally {
       file.close();
     }
   });
 
-  await test('Zip64：EOCD 用 0xffff/0xffffffff 占位时，条目数与偏移从 Zip64 EOCD 取', async () => {
+  await test('Zip64: read entry count and offsets from Zip64 EOCD when standard EOCD fields are placeholders', async () => {
     const { ZipArchive, ZipFile } = require('../src/core/zip');
     const name = Buffer.from('hello.txt');
     const data = Buffer.from('hello zip64 apkstart');
-    // 本地头
+    // Local header
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0);
     lh.writeUInt16LE(45, 4);
@@ -351,7 +351,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     lh.writeUInt32LE(data.length, 22);
     lh.writeUInt16LE(name.length, 26);
     const cenStart = lh.length + name.length + data.length;
-    // 中央目录项：三个字段置 0xffffffff，真实值进 Zip64 extra（id=0x0001）
+    // Central directory entry: set three fields to 0xffffffff and store actual values in the Zip64 extra (id=0x0001)
     const extra = Buffer.alloc(28);
     extra.writeUInt16LE(0x0001, 0);
     extra.writeUInt16LE(24, 2);
@@ -368,7 +368,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     ch.writeUInt32LE(0xffffffff, 42);
     name.copy(ch, 46);
     extra.copy(ch, 46 + name.length);
-    // Zip64 EOCD + locator + 传统 EOCD（全部进位）
+    // Zip64 EOCD, locator, and legacy EOCD (all fields overflow)
     const z64 = Buffer.alloc(56);
     z64.writeUInt32LE(0x06064b50, 0);
     z64.writeBigUInt64LE(44n, 4);
@@ -391,133 +391,133 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const buf = Buffer.concat([lh, name, data, ch, z64, loc, eocd]);
 
     const mem = new ZipArchive(buf);
-    assert(mem.has('hello.txt'), 'ZipArchive 应能认出 Zip64 条目');
-    assert(String(mem.read('hello.txt')) === 'hello zip64 apkstart', 'ZipArchive 内容应正确');
-    assert(mem.entries.get('hello.txt').uncompSize === data.length, 'ZipArchive 未压缩大小应从 extra 取');
+    assert(mem.has('hello.txt'), 'ZipArchive should recognize the Zip64 entry');
+    assert(String(mem.read('hello.txt')) === 'hello zip64 apkstart', 'ZipArchive contents should match');
+    assert(mem.entries.get('hello.txt').uncompSize === data.length, 'ZipArchive should read the uncompressed size from the extra field');
 
     const zipPath = path.join(TMP, 'zip64.zip');
     fs.writeFileSync(zipPath, buf);
     const file = new ZipFile(zipPath);
     try {
-      assert(file.has('hello.txt'), 'ZipFile 应能认出 Zip64 条目');
-      assert(String(file.read('hello.txt')) === 'hello zip64 apkstart', 'ZipFile 内容应正确');
-      assert(file.entries.get('hello.txt').localOffset === 0, 'ZipFile 本地头偏移应从 extra 取');
+      assert(file.has('hello.txt'), 'ZipFile should recognize the Zip64 entry');
+      assert(String(file.read('hello.txt')) === 'hello zip64 apkstart', 'ZipFile contents should match');
+      assert(file.entries.get('hello.txt').localOffset === 0, 'ZipFile should read the local-header offset from the extra field');
     } finally {
       file.close();
     }
   });
 
-  console.log('\n[emulator.js AVD 零配置]');
+  console.log('\n[emulator.js zero-configuration AVD]');
 
-  await test('AVD 使用小数据分区 + 快速启动 + 现代 GPU 模式', () => {
+  await test('AVD uses a small data partition, quick boot, and a modern GPU mode', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const r = emu.ensureAvd({ memoryMB: 2048, cores: 2, gpu: 'software', dataMB: 4096, accel: 'auto' });
     const cfg = fs.readFileSync(path.join(r.avdDir, 'config.ini'), 'utf8');
     assert(/^hw\.ramSize=2048$/m.test(cfg));
-    assert(/^disk\.dataPartition\.size=4096M$/m.test(cfg), '数据分区不应是 16G');
+    assert(/^disk\.dataPartition\.size=4096M$/m.test(cfg), 'The data partition should not be 16 GB');
     assert(/^hw\.gpu\.mode=software$/m.test(cfg));
-    assert(!/^fastboot\.forceColdBoot=yes$/m.test(cfg), '不应再强制冷启动');
-    assert(!/^fastboot\.forceFastBoot=/m.test(cfg), '快照应由命令行 -snapshot 控制，避免加载旧 default_boot');
+    assert(!/^fastboot\.forceColdBoot=yes$/m.test(cfg), 'Cold boot must not be forced');
+    assert(!/^fastboot\.forceFastBoot=/m.test(cfg), 'Control snapshots with the -snapshot command-line flag to avoid loading the old default_boot.');
     assert(/^hw\.cpu\.arch=x86_64$/m.test(cfg));
-    assert(fs.existsSync(path.join(r.avdDir, 'snapshot.key')), '应写入快照指纹');
+    assert(fs.existsSync(path.join(r.avdDir, 'snapshot.key')), 'Expected the snapshot fingerprint to be written');
   });
 
-  await test('启动参数带自动内存/核心/快照，且不再用弃用的 GPU 模式', () => {
+  await test('Startup arguments include automatic memory, cores, and snapshots without a deprecated GPU mode', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
-    // 快照不存在时（全新 AVD / 刚被作废）绝不能传 -snapshot：
-    // qemu 会一直等一份不存在的内存状态，进程活着但永不开机。
+    // When no snapshot exists (new AVD or invalidated snapshot), never pass -snapshot:
+    // QEMU would wait for a nonexistent memory state, leaving the process running without booting.
     const fresh = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
     assert(/-gpu software/.test(fresh));
     assert(!/swiftshader_indirect/.test(fresh));
     assert(/-memory 2048/.test(fresh) && /-cores 2/.test(fresh));
     if (!emu.hasSnapshot()) {
-      // 没有快照时必须「只禁加载、不禁保存」：-no-snapshot 会连退出自动保存一起关掉，
-      // 那样第一次冷启动结束后永远产生不了快照，用户每次点开都是全量引导。
-      assert(/-no-snapshot-load/.test(fresh), '没有快照时应用 -no-snapshot-load（只跳过加载）');
-      assert(!/ -no-snapshot( |$)/.test(fresh), '没有快照时不能用 -no-snapshot（会禁掉退出保存）');
+      // Without a snapshot, disable loading only, not saving: -no-snapshot also disables the automatic save on exit,
+      // so the first cold boot would never create a snapshot and every launch would require a full boot.
+      assert(/-no-snapshot-load/.test(fresh), 'Use -no-snapshot-load when no snapshot exists (skip loading only)');
+      assert(!/ -no-snapshot( |$)/.test(fresh), 'Do not use -no-snapshot when there is no snapshot (it disables saving on exit)');
     }
-    // 快照确实存在时才走 quickboot。注意要真的「像一个完整快照」：
-    // 保存中断会留下只有几十字节 snapshot.pb 的空壳，那种必须判定为没有快照，
-    // 否则 emulator 会尝试加载、失败，再回退冷启动，白等几秒。
+    // Use quick boot only when a snapshot exists. It must be a complete snapshot:
+    // An interrupted save can leave an incomplete snapshot.pb of only a few dozen bytes; treat it as no snapshot,
+    // or the emulator will attempt to load it, fail, then fall back to a cold boot after an unnecessary delay.
     const avdDir = path.join(emu.provisioner.paths().avdHome, 'apkstart.avd');
     const snapDir = path.join(avdDir, 'snapshots');
     const created = !fs.existsSync(snapDir);
     fs.mkdirSync(path.join(snapDir, 'apkstart'), { recursive: true });
 
-    // 空壳（12 字节 pb + 没有 ram.img）必须当作「没有快照」
+    // Treat an empty snapshot (12-byte pb and no ram.img) as no snapshot
     fs.writeFileSync(path.join(snapDir, 'apkstart', 'snapshot.pb'), 'x'.repeat(12));
-    assert(!emu.hasSnapshot(), '不完整的快照不能被当成可用快照');
+    assert(!emu.hasSnapshot(), 'An incomplete snapshot must not be treated as usable');
     const broken = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
-    assert(/-no-snapshot-load/.test(broken), '空壳快照必须回退冷启动（跳过加载）');
+    assert(/-no-snapshot-load/.test(broken), 'An empty snapshot must fall back to a cold boot (skip loading)');
 
-    // 完整快照：pb 有内容 + ram.img 有数据（上一步的空壳会被 hasSnapshot 顺手清掉）
+    // Complete snapshot: pb and ram.img both contain data (hasSnapshot removes the empty snapshot above)
     fs.mkdirSync(path.join(snapDir, 'apkstart'), { recursive: true });
     fs.writeFileSync(path.join(snapDir, 'apkstart', 'snapshot.pb'), 'x'.repeat(2048));
     fs.writeFileSync(path.join(snapDir, 'apkstart', 'ram.img'), Buffer.alloc(2 * 1024 * 1024));
     const withSnap = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
-    assert(/-snapshot apkstart/.test(withSnap), '有快照时应使用 quickboot 快照');
-    assert(!/-no-snapshot-load/.test(withSnap), '有完整快照时不该跳过加载');
+    assert(/-snapshot apkstart/.test(withSnap), 'Use the quickboot snapshot when available');
+    assert(!/-no-snapshot-load/.test(withSnap), 'Do not skip loading a complete snapshot');
     if (created) fs.rmSync(snapDir, { recursive: true, force: true });
 
     const cold = emu.buildArgs({ wipe: true }).join(' ');
-    assert(/-wipe-data/.test(cold), 'wipe 时必须带 -wipe-data');
-    // 重置数据时：不加载旧快照（数据对不上），但**允许保存**新快照。
-    // 「修复网络」依赖这条链路：重置后第一次开机有网 → 立刻存快照 → 下次恢复。
-    // 老实现这里推 -no-snapshot，会把保存一起关掉，导致修完网络存不下快照。
-    assert(/ -no-snapshot-load( |$)/.test(cold), 'wipe 时不该加载旧快照');
-    assert(!/ -no-snapshot( |$)/.test(cold), 'wipe 时仍要允许保存新快照（修复网络依赖它）');
+    assert(/-wipe-data/.test(cold), 'Pass -wipe-data when resetting user data');
+    // When resetting data, do not load the old snapshot (it no longer matches), but **allow saving** a new one.
+    // Repair network relies on this sequence: reset data, boot with networking, save a snapshot immediately, and restore it next time.
+    // The old implementation passed -no-snapshot here, disabling saves as well and preventing the repaired network state from being saved.
+    assert(/ -no-snapshot-load( |$)/.test(cold), 'Do not load the old snapshot after a data reset');
+    assert(!/ -no-snapshot( |$)/.test(cold), 'Continue saving a new snapshot after a data reset (network repair depends on it)');
   });
 
-  // 窗口代理脚本里有大量中文注释。PowerShell 5.1 读「无 BOM 的 UTF-8」会按 ANSI 解码，
-  // 中文变成乱码后可能把 C# 注释和下一行代码并成一行 —— Add-Type 直接编译失败，
-  // 表现就是「窗口代理启动失败 / 应用窗口不嵌入」。这个坑踩过一次，用测试钉住。
-  await test('窗口代理脚本必须带 UTF-8 BOM（否则中文注释会让 Add-Type 编译失败）', () => {
+  // The window-agent script contains UTF-8 comments. PowerShell 5.1 decodes UTF-8 without a BOM as ANSI,
+  // which can garble the comments and merge them with the following C# code. Add-Type then fails to compile,
+  // causing the window agent to fail and app windows not to embed. This regression test prevents a repeat.
+  await test('The window-agent script must have a UTF-8 BOM (otherwise PowerShell 5.1 may fail to compile it)', () => {
     const file = path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1');
     const buf = fs.readFileSync(file);
-    assert(buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf, 'agent.ps1 缺少 UTF-8 BOM');
+    assert(buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf, 'agent.ps1 is missing its UTF-8 BOM');
   });
 
-  // 模拟器窗口必须是 Chromium 渲染层的「子窗口」，不能是宿主的兄弟子窗口。
-  // 兄弟关系下 Electron 会持续把网页层抬到最前，黑底盖住安卓画面、鼠标全被吃掉
-  // （黑边 / 未填满 / 点击失效 / 点不动同意）。也不能再给嵌入窗口设 window region，
-  // 那会破坏命中测试且在 resize 后露出黑边。
-  await test('嵌入窗口必须挂到网页层之下，且不能再设 window region', () => {
+  // The emulator window must be a child of Chromium’s renderer, not a sibling child of the host.
+  // As siblings, Electron continually raises the web layer above the emulator, covering the Android image and consuming mouse input
+  // (black bars, incomplete image, ignored clicks, or an unresponsive consent button). Do not set a window region on the embedded window either;
+  // that breaks hit testing and can reveal black bars after resizing.
+  await test('Parent the embedded window under the renderer and do not set a window region', () => {
     const file = path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1');
     const src = fs.readFileSync(file, 'utf8');
-    assert(/SetParent\(emu, parent\)/.test(src), 'embed 必须挂到 FindChromeRender 找到的父窗口');
-    assert(/FindChromeRender\(host\)/.test(src), '必须查找 Chromium 渲染子窗口');
-    assert(!/CreateRectRgn\(0, clipTop/.test(src), '不能给嵌入窗口设裁剪 region');
-    assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'embed 时要清掉旧版本残留的 region');
+    assert(/SetParent\(emu, parent\)/.test(src), 'embed must use the parent returned by FindChromeRender');
+    assert(/FindChromeRender\(host\)/.test(src), 'Must find the Chromium renderer child window');
+    assert(!/CreateRectRgn\(0, clipTop/.test(src), 'Must not clip the embedded window with a region');
+    assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'Clear any region left by an older version during embed');
   });
 
-  // 旋转必须换「物理面板尺寸」并重启，不能只改运行时 wm size / density。
-  //   - wm size：物理 LCD 仍是竖的 -> 画面躺倒 90°、只占左上角一条、点击坐标错位；
-  //   - wm density：framebuffer 尺寸不变 -> 画面不铺满，最大化后右侧一大片空白。
-  await test('横屏必须靠物理面板尺寸（lcdFor landscape），且不得再用运行期 wm size 旋转', () => {
+  // Rotation must change the physical panel dimensions and restart the emulator, not just change runtime wm size or density.
+  //   - wm size: the physical LCD remains portrait, so the image rotates sideways, occupies only a strip in the corner, and click coordinates are wrong;
+  //   - wm density: the framebuffer dimensions do not change, so the image does not fill the window and leaves a large blank area when maximized.
+  await test('Landscape must use physical panel dimensions (lcdFor landscape), not runtime wm size rotation', () => {
     const doctor = require('../src/core/doctor');
     const p = doctor.lcdFor({ accelOk: true, landscape: false });
     const l = doctor.lcdFor({ accelOk: true, landscape: true });
-    assert(p.w === 720 && p.h === 1280, `竖屏应是 720x1280，实际 ${p.w}x${p.h}`);
-    assert(l.w === 1280 && l.h === 720, `横屏应是 1280x720，实际 ${l.w}x${l.h}`);
+    assert(p.w === 720 && p.h === 1280, `Expected portrait 720x1280; got ${p.w}x${p.h}`);
+    assert(l.w === 1280 && l.h === 720, `Expected landscape 1280x720; got ${l.w}x${l.h}`);
 
     const adb = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'adb.js'), 'utf8');
     const i = adb.indexOf('async setOrientation(');
     const j = adb.indexOf('async resetDisplayOverrides(');
     const body = adb.slice(i, j);
-    assert(!/wm size \d/.test(body), 'setOrientation 不得再设置 wm size 覆盖');
-    assert(/wm density 190/.test(body), 'density 只作为退化路径保留');
+    assert(!/wm size \d/.test(body), 'setOrientation must not override wm size');
+    assert(/wm density 190/.test(body), 'Keep density only as a fallback');
   });
 
-  await test('游戏模式必须使用高优先级且关闭全局鼠标钩子', () => {
+  await test('Game mode must use high priority and disable the global mouse hook', () => {
     const ps = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), 'utf8');
-    assert(/game\s*=\s*'High'/.test(ps), 'game 级别要把 qemu 提到 High');
+    assert(/game\s*=\s*'High'/.test(ps), 'Game mode must raise QEMU to High priority');
     const aw = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
-    assert(/opts\.enabled && !game/.test(aw), 'game 模式不能装 WH_MOUSE_LL 全局钩子');
+    assert(/opts\.enabled && !game/.test(aw), 'Game mode must not install the WH_MOUSE_LL global hook');
   });
 
-  await test('新版 emulator 写的 ram.bin 必须被认作完整快照（否则刚存好的 3GB 会被当空壳删掉）', () => {
+  await test('Recognize the newer emulator ram.bin as a complete snapshot (otherwise a newly saved 3 GB snapshot may be deleted as empty)', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const avdDir = path.join(emu.provisioner.paths().avdHome, 'apkstart.avd');
@@ -526,83 +526,83 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     fs.mkdirSync(snapDir, { recursive: true });
     fs.writeFileSync(path.join(snapDir, 'snapshot.pb'), 'x'.repeat(2048));
     fs.writeFileSync(path.join(snapDir, 'ram.bin'), Buffer.alloc(2 * 1024 * 1024));
-    assert(emu.hasSnapshot(), 'ram.bin 应被认作完整快照');
+    assert(emu.hasSnapshot(), 'ram.bin should be recognized as a complete snapshot');
     const args = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
-    assert(/-snapshot apkstart/.test(args), '有快照时应走 quickboot');
-    assert(!/-no-snapshot-load/.test(args), '有完整快照时不该跳过加载');
+    assert(/-snapshot apkstart/.test(args), 'Use quick boot when a snapshot exists');
+    assert(!/-no-snapshot-load/.test(args), 'Do not skip loading a complete snapshot');
     fs.rmSync(path.join(avdDir, 'snapshots'), { recursive: true, force: true });
   });
 
-  await test('userdata 种子镜像：4K block + ENCRYPT + 记账自洽', () => {
+  await test('userdata seed image: 4 KB blocks, ENCRYPT, and consistent accounting', () => {
     const { buildEmptyExt4 } = require('../src/core/userdata');
     const sb = 1024;
     const img = buildEmptyExt4({ sizeMB: 64, encrypt: false });
-    assert(img.readUInt16LE(sb + 0x38) === 0xEF53, 'superblock 魔数必须是 0xEF53');
-    // dm-default-key（Android 13 的 /data 元数据加密）逻辑块大小是 4096，
-    // fs block 小于它会让 mount() 返回 EINVAL —— 这是「挂不上 /data」的真凶。
-    assert(img.readUInt32LE(sb + 0x18) === 2, 's_log_block_size 必须是 2（4096 字节）');
-    assert(img.readUInt32LE(sb + 0x1C) === 2, 's_log_cluster_size 必须等于 block size');
-    // 没有 ext_attr 时 setxattr 返回 EOPNOTSUPP，SELinux 标签写不进去，
-    // netd / media / tombstoned 会一起 exit 1，开机卡在动画上。
-    assert((img.readUInt32LE(sb + 0x5C) & 0x8) !== 0, '必须带 ext_attr');
+    assert(img.readUInt16LE(sb + 0x38) === 0xEF53, 'Superblock magic must be 0xEF53');
+    // dm-default-key (Android 13 /data metadata encryption) uses a 4096-byte logical block size,
+    // so a smaller filesystem block makes mount() return EINVAL and prevents /data from mounting.
+    assert(img.readUInt32LE(sb + 0x18) === 2, 's_log_block_size must be 2 (4096 bytes)');
+    assert(img.readUInt32LE(sb + 0x1C) === 2, 's_log_cluster_size must equal the block size');
+    // Without ext_attr, setxattr returns EOPNOTSUPP and SELinux labels cannot be written,
+    // causing netd, media, and tombstoned to exit 1 and leaving boot stuck at the animation.
+    assert((img.readUInt32LE(sb + 0x5C) & 0x8) !== 0, 'ext_attr must be enabled');
     const total = img.readUInt32LE(sb + 0x04);
     const free = img.readUInt32LE(sb + 0x0C);
     const inodes = img.readUInt32LE(sb + 0x00);
     const freeInodes = img.readUInt32LE(sb + 0x10);
-    assert(free > 0 && free < total, '空闲块数必须落在 (0, total) 之间');
-    assert(freeInodes === inodes - 10, '空闲 inode 必须扣掉 1~10 号保留（e2fsck 会核对）');
+    assert(free > 0 && free < total, 'Free blocks must be between 0 and total');
+    assert(freeInodes === inodes - 10, 'Free inode count must exclude reserved inodes 1–10 (checked by e2fsck)');
     const withEnc = buildEmptyExt4({ sizeMB: 64 });
-    assert((withEnc.readUInt32LE(sb + 0x60) & 0x10000) !== 0, '默认必须带 ENCRYPT（FBE 必需）');
-    assert((img.readUInt32LE(sb + 0x60) & 0x10000) === 0, 'encrypt:false 时要能摘掉该位');
+    assert((withEnc.readUInt32LE(sb + 0x60) & 0x10000) !== 0, 'ENCRYPT must be enabled by default (required for FBE)');
+    assert((img.readUInt32LE(sb + 0x60) & 0x10000) === 0, 'encrypt:false must clear this flag');
   });
 
-  console.log('\n[显示 / 快捷方式 / 零操作]');
-  await test('窗口模式必须真的开窗口（否则应用进程活着但屏幕上看不见）', () => {
+  console.log('\n[Display, shortcuts, and zero-configuration behavior]');
+  await test('Window mode must show a real window (otherwise the app process runs but is invisible)', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const win = emu.buildArgs({ headless: false, gpu: 'software', lcd: { w: 720, h: 1280, dpi: 320 } }).join(' ');
-    assert(!/-no-window/.test(win), '窗口模式不能再用 -no-window');
-    // 不能再带 -no-skin：它会覆盖 -skin，让面板尺寸退回 config.ini 里的旧值，
-    // 表现为「设置切了横屏、实际还是竖屏」「画面只占左上角一条」。
-    assert(!/\s-no-skin(\s|$)/.test(win), '窗口模式不能带 -no-skin（会覆盖 -skin）');
-    assert(/-skin \d+x\d+/.test(win), '窗口模式必须用 -skin 明确面板尺寸');
+    assert(!/-no-window/.test(win), 'Window mode must not use -no-window');
+    // Do not pass -no-skin: it overrides -skin and restores the old panel dimensions from config.ini,
+    // causing landscape settings to remain portrait or the image to appear only as a strip in the corner.
+    assert(!/\s-no-skin(\s|$)/.test(win), 'Window mode must not pass -no-skin (it overrides -skin)');
+    assert(/-skin \d+x\d+/.test(win), 'Window mode must use -skin to specify panel dimensions');
     const headless = emu.buildArgs({ headless: true }).join(' ');
     assert(/-no-window/.test(headless));
   });
 
-  await test('音频：默认开启（不带 -no-audio），关闭后才带 -no-audio', () => {
+  await test('Audio is enabled by default (no -no-audio); pass -no-audio only when disabled', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
-    // 覆盖 settings getter：默认开启不应有 -no-audio
+    // Override the settings getter: audio is on by default, so omit -no-audio.
     Object.defineProperty(emu, 'settings', { configurable: true, get: () => ({ engine: { audio: true } }) });
     const on = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
-    assert(!/-no-audio/.test(on), 'audio=true 时不应传 -no-audio');
-    // 关闭后才应带 -no-audio
+    assert(!/-no-audio/.test(on), 'Do not pass -no-audio when audio=true');
+    // Pass -no-audio only when audio is disabled.
     Object.defineProperty(emu, 'settings', { configurable: true, get: () => ({ engine: { audio: false } }) });
     const off = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
-    assert(/-no-audio/.test(off), 'audio=false 时应传 -no-audio');
+    assert(/-no-audio/.test(off), 'Pass -no-audio when audio=false');
   });
 
-  await test('旧配置强制迁移：无头与「启动后退出」不再生效', () => {
+  await test('Migrate old settings: headless and “exit after launch” are no longer supported', () => {
     const store = require('../src/core/store');
     store.saveSettings({ engine: { headless: true }, hideAfterLaunch: true });
     const s = store.getSettings();
-    assert(s.engine.headless === false, 'headless 必须被迁移成 false');
-    assert(s.hideAfterLaunch === false, 'hideAfterLaunch 必须为 false');
-    assert(s.autoStart === true && s.autoDeploy === true, '开机自启/一键部署默认开启');
-    assert(s.createStartMenuShortcut === true, '开始菜单快捷方式默认开启');
+    assert(s.engine.headless === false, 'headless must be migrated to false');
+    assert(s.hideAfterLaunch === false, 'hideAfterLaunch must be false');
+    assert(s.autoStart === true && s.autoDeploy === true, 'Auto-start and one-click setup are enabled by default');
+    assert(s.createStartMenuShortcut === true, 'Start Menu shortcut is enabled by default');
   });
 
-  await test('显示适配：窗口/全屏共用竖屏分辨率，窗口比例 9:16 可拉伸', () => {
+  await test('Display sizing: window and full-screen share portrait resolution; the 9:16 window can stretch', () => {
     const d = require('../src/core/display');
     const area = { x: 0, y: 0, w: 1920, h: 1080 };
-    // 全屏不改变 Android 分辨率（模拟器窗口宽高比被 LCD 锁定），只最大化窗口
+    // Full-screen does not change Android resolution (the LCD fixes the emulator aspect ratio); it only maximizes the window.
     assert(JSON.stringify(d.sizeFor('fullscreen', '900x1600', area)) === JSON.stringify({ w: 900, h: 1600 }));
     assert(JSON.stringify(d.sizeFor('window', '720x1280', area)) === JSON.stringify({ w: 720, h: 1280 }));
-    assert(d.sizeFor('window', '横屏乱填', area).h > d.sizeFor('window', '横屏乱填', area).w);
+    assert(d.sizeFor('window', 'invalid landscape input', area).h > d.sizeFor('window', 'invalid landscape input', area).w);
     const b = d.defaultBounds(area);
     assert(b.h > b.w && b.h <= area.h && b.x >= 0 && b.y >= 0, JSON.stringify(b));
-    // 全屏：铺满高度、按竖屏比例算宽度并居中（窗口宽高比被模拟器 LCD 锁定）
+    // Full-screen fills the height, calculates width using the portrait ratio, and centers the window (the emulator LCD fixes its aspect ratio).
     const f = d.fullscreenBounds('900x1600', area);
     assert(f.h === area.h, JSON.stringify(f));
     assert(Math.abs(f.w - Math.round(f.h * 900 / 1600)) <= 1, JSON.stringify(f));
@@ -611,7 +611,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(d.densityFor(720, 1280, 240) === 240);
   });
 
-  await test('adb 显示命令使用 wm size / wm density', async () => {
+  await test('adb display commands use wm size and wm density', async () => {
     const { AdbClient } = require('../src/core/adb');
     const cmds = [];
     const fake = { shell: async (c) => { cmds.push(c); return ''; } };
@@ -622,32 +622,32 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(cmds.includes('wm size reset') && cmds.includes('wm density reset'));
   });
 
-  await test('PNG-in-ICO 与 WebP 图标兜底都能产出可用 ICO', async () => {
+  await test('PNG-in-ICO and WebP icon fallbacks both produce valid ICO files', async () => {
     const { pngBytesToIco, iconToIco } = require('../src/core/shortcut');
     const { drawAppIcon } = require('../src/core/png');
     const png = drawAppIcon(64);
     const ico = pngBytesToIco(png);
-    assert(ico && ico.readUInt16LE(2) === 1 && ico.readUInt16LE(4) === 1, 'ICO 头应声明 1 个图像');
-    assert(ico.readUInt32LE(14) === png.length, '内嵌 PNG 长度应一致');
-    assert(ico.slice(22).equals(png), 'ICO 数据区应就是原 PNG');
+    assert(ico && ico.readUInt16LE(2) === 1 && ico.readUInt16LE(4) === 1, 'ICO header should declare one image');
+    assert(ico.readUInt32LE(14) === png.length, 'Embedded PNG size should match');
+    assert(ico.slice(22).equals(png), 'ICO image data should be the original PNG');
     assert(pngBytesToIco(Buffer.from('not a png')) === null);
-    // WebP（nativeImage 解不了）→ 无 decode 回调时应回退到品牌占位 ICO
+    // If nativeImage cannot decode WebP, use the branded placeholder ICO when no decode callback is supplied.
     const webp = Buffer.concat([Buffer.from('RIFF\x00\x00\x00\x00WEBP'), Buffer.alloc(32)]);
     const fallback = await iconToIco(webp);
-    assert(fallback && fallback.length > 22, 'WebP 也应拿到图标');
+    assert(fallback && fallback.length > 22, 'WebP should still produce an icon');
     const decoded = await iconToIco(webp, { decode: async () => png });
-    assert(decoded && decoded.slice(22).equals(png), '有 decode 时应使用真实图标');
+    assert(decoded && decoded.slice(22).equals(png), 'Use the real icon when decode is available');
   });
 
-  await test('窗口控制脚本存在且为纯 ASCII（避免中文路径/标题乱码）', () => {
+  await test('Window-control script exists and is ASCII-only (avoids encoding issues in paths and titles)', () => {
     const w = require('../src/core/windowctl');
-    assert(fs.existsSync(w.SCRIPT), '缺少 windowctl.ps1');
+    assert(fs.existsSync(w.SCRIPT), 'Missing windowctl.ps1');
     const b = fs.readFileSync(w.SCRIPT);
-    assert(!b.some((x) => x > 127), 'ps1 必须纯 ASCII，中文通过 UTF-8 JSON 传入');
+    assert(!b.some((x) => x > 127), 'The PowerShell script must be ASCII-only; non-ASCII values are passed as UTF-8 JSON');
     assert(typeof w.present === 'function' && typeof w.getBounds === 'function');
   });
 
-  await test('xzFile 把源文件喂进 stdin 并产出可被运行时解压的镜像（CI 挂死回归）', async () => {
+  await test('xzFile streams the source file to stdin and produces an image the runtime can decompress (CI hang regression)', async () => {
     const { xzFile } = require('../build/prepare-runtime');
     const zlib = require('zlib');
     const crypto = require('crypto');
@@ -663,14 +663,14 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const dest = path.join(dir, 'sample.img.xz');
 
     const saved = { XZ_PRESET: process.env.XZ_PRESET, XZ_TIMEOUT_MS: process.env.XZ_TIMEOUT_MS };
-    process.env.XZ_PRESET = '1';           // 小样本走最快档，别拖慢整套测试
-    process.env.XZ_TIMEOUT_MS = '15000';  // 真挂死时 15s 内 kill，别把 CI 卡住
+    process.env.XZ_PRESET = '1';           // Use the fastest preset for the small fixture so the test suite stays quick.
+    process.env.XZ_TIMEOUT_MS = '15000';  // Kill after 15 seconds if it hangs; do not stall CI.
     let timer;
     try {
       await Promise.race([
         xzFile(src, dest),
         new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('xzFile 25s 内未返回（stdin 没接 EOF？）')), 25000);
+          timer = setTimeout(() => reject(new Error('xzFile did not return within 25 seconds (was stdin left without EOF?)')), 25000);
         }),
       ]);
     } finally {
@@ -682,19 +682,19 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
 
     const have = (p) => (fs.existsSync(p) ? fs.statSync(p).size : 0);
     const out = have(dest) > 0 ? dest : dest.replace(/\.xz$/, '.gz');
-    assert(have(out) > 0, '压缩产物不能是 0 字节');
+    assert(have(out) > 0, 'Compressed output must not be empty');
     let back;
     if (/\.xz$/i.test(out)) {
-      // 不依赖 @napi-rs/lzma 原生 binding：CI 的 Node 20 job 会因
-      // npm optional dependencies 的已知 bug 加载不到它（Node 22 正常）。
-      // 这里用与压缩端同一个 python 的 lzma 读回，并校验 XZ 魔数，
-      // 运行时的解压兼容性由真实安装包端到端验证覆盖。
+      // Do not rely on the @napi-rs/lzma native binding: the Node 20 CI job may fail to load it because of
+      // a known npm optional-dependencies bug (Node 22 works).
+      // Use Python lzma to read the output and validate the XZ magic,
+      // while end-to-end installer tests validate runtime decompression compatibility.
       assert(fs.readFileSync(out).subarray(0, 6).equals(
         Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]),
-      ), '必须是合法的 XZ 容器');
+      ), 'Must be a valid XZ container');
       const { findPython } = require('../build/prepare-runtime');
       const py = findPython();
-      assert(py, '产出 XZ 却找不到 python，无法校验');
+      assert(py, 'XZ output exists, but Python is unavailable for validation');
       const backPath = path.join(dir, 'sample.img.back');
       require('child_process').execFileSync(py, ['-c',
         'import lzma,sys;open(sys.argv[1],"wb").write(lzma.open(sys.argv[2],"rb").read())',
@@ -703,62 +703,62 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     } else {
       back = zlib.gunzipSync(fs.readFileSync(out));
     }
-    assert(back.equals(payload), '解压内容必须与源镜像逐字节一致');
+    assert(back.equals(payload), 'Decompressed bytes must exactly match the source image');
   });
 
-  console.log('\n[container.js 应用级容器]');
+  console.log('\n[container.js app-level containers]');
 
   const container = require('../src/core/container');
 
-  await test('系统/框架包永不裁剪，用户 App 才纳入会话清理', () => {
+  await test('Never trim system/framework packages; session cleanup applies only to user apps', () => {
     for (const p of ['android', 'com.android.systemui', 'com.google.android.gms', 'com.foo.bar.baz']) {
       const sys = container.isSystemPackage(p);
-      if (p.startsWith('com.foo')) assert(!sys, `${p} 应识别为用户 App`);
-      else assert(sys, `${p} 应识别为系统包`);
+      if (p.startsWith('com.foo')) assert(!sys, `${p} should be recognized as a user app`);
+      else assert(sys, `${p} should be recognized as a system package`);
     }
-    assert(container.isSystemPackage(''), '空包名当作系统包，避免生成非法命令');
+    assert(container.isSystemPackage(''), 'Treat an empty package name as a system package to prevent invalid commands');
   });
 
-  await test('启动应用只停其他已装 App，默认绝不动系统包', () => {
+  await test('Starting an app stops only other installed user apps; system packages are untouched by default', () => {
     const r = container.buildSessionCommands({
       pkg: 'com.phoenix.read',
       installed: ['com.phoenix.read', 'com.other.app', 'com.android.vending', 'com.google.android.gms', 'com.third.game'],
     });
-    assert(r.stopped.length === 2, `应停 2 个其他用户 App，实际 ${r.stopped.join(',')}`);
+    assert(r.stopped.length === 2, `Expected to stop two other user apps; stopped: ${r.stopped.join(',')}`);
     assert(r.stopped.includes('com.other.app') && r.stopped.includes('com.third.game'));
-    assert(!r.commands.some((c) => c.includes('pm disable')), '默认不能禁用系统包');
-    assert(!r.commands.some((c) => c.includes('kill-all')), '启动阶段不能清后台，避免误伤刚进前台的 App');
-    assert(!r.commands.some((c) => /force-stop (android|com\.android|com\.google\.android)/.test(c)), '不能 force-stop 系统框架');
+    assert(!r.commands.some((c) => c.includes('pm disable')), 'System packages must not be disabled by default');
+    assert(!r.commands.some((c) => c.includes('kill-all')), 'Do not kill background apps during launch; that could stop the app that just came to the foreground');
+    assert(!r.commands.some((c) => /force-stop (android|com\.android|com\.google\.android)/.test(c)), 'Must not force-stop the system framework');
   });
 
-  await test('包名白名单：被污染的清单不会拼出注入命令', () => {
+  await test('Package-name allowlist prevents command injection from a corrupted list', () => {
     const r = container.buildSessionCommands({
       pkg: 'com.phoenix.read',
       installed: ['com.evil;rm -rf /', 'com.ok.app', '$(whoami)', 'com.foo-bar'],
     });
-    assert(r.stopped.length === 1 && r.stopped[0] === 'com.ok.app', `只应停合法包名，实际 ${r.stopped.join(',')}`);
-    assert(!r.commands.some((c) => c.includes('rm -rf') || c.includes('$(')), '不能出现注入片段');
+    assert(r.stopped.length === 1 && r.stopped[0] === 'com.ok.app', `Only valid package names should be stopped; got ${r.stopped.join(',')}`);
+    assert(!r.commands.some((c) => c.includes('rm -rf') || c.includes('$(')), 'Command must not contain injected fragments');
   });
 
-  await test('深度裁剪可禁用后台包，且能完整恢复、不碰必需组件', () => {
+  await test('Deep trimming can disable background packages, restore them completely, and preserve required components', () => {
     const r = container.buildSessionCommands({
       pkg: 'com.phoenix.read', installed: [], deep: true,
     });
-    assert(r.disabled.length > 0, '深度裁剪应有可禁用项');
+    assert(r.disabled.length > 0, 'Deep trimming should have packages to disable');
     assert(r.commands.some((c) => c.includes('pm disable-user --user 0 com.android.vending')));
     for (const p of container.NEVER_TRIM) {
-      assert(!r.disabled.includes(p), `${p} 绝不能被禁用`);
+      assert(!r.disabled.includes(p), `${p} must never be disabled`);
     }
     const back = container.buildRestoreCommands();
     for (const p of container.OPTIONAL_SYSTEM) {
-      assert(back.some((c) => c.includes(`pm enable ${p}`)), `${p} 必须可恢复`);
+      assert(back.some((c) => c.includes(`pm enable ${p}`)), `${p} must be restorable`);
     }
   });
 
-  await test('容器停放：清后台 + Android idle，且状态机覆盖多窗口/最后关闭', () => {
+  await test('Container parking clears background apps and enters Android idle; state covers multiple windows and the final close', () => {
     const idle = container.buildIdleCommands();
-    assert(idle.some((c) => c.includes('am kill-all')), '停放要清后台缓存进程');
-    assert(idle.some((c) => c.includes('deviceidle force-idle')), '停放要让 Android 进 idle');
+    assert(idle.some((c) => c.includes('am kill-all')), 'Parking should clear cached background processes');
+    assert(idle.some((c) => c.includes('deviceidle force-idle')), 'Parking should put Android into idle');
     let s = container.nextSessionState([], 'open', 'a');
     assert(s.hasApp && !s.idle && s.foreground === 'a');
     s = container.nextSessionState(s.active, 'open', 'b');
@@ -766,20 +766,20 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     s = container.nextSessionState(s.active, 'close', 'a');
     assert(s.active.length === 1 && s.hasApp && !s.idle);
     s = container.nextSessionState(s.active, 'close', 'b');
-    assert(s.idle && !s.hasApp && s.active.length === 0, '最后一个窗口关闭后容器应停放');
+    assert(s.idle && !s.hasApp && s.active.length === 0, 'Park the container after the last window closes');
   });
 
-  await test('doctor 轻量容器：收敛 vCPU，手动设置优先', () => {
+  await test('doctor lightweight container: cap vCPU while honoring manual settings', () => {
     const host = { totalMB: 32768, freeMB: 20000, cores: 16, home: 'C:\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
     const lite = doctor.liteProfile({ host, engine: {} });
-    // 老逻辑是 floor(核数/4) 夹到 2~3 —— 8 核机器只给 2 个 vCPU，视频应用直接卡。
-    // 现在均衡模式给「一半物理核、上限 4」，省资源模式固定 2。
-    assert(lite && lite.cores === 4, `16 核机器均衡模式应给 4 核，实际 ${lite && lite.cores}`);
+    // The old logic used floor(cores/4), clamped to 2–3, so an 8-core machine got only 2 vCPUs and video apps lagged.
+    // Balanced mode now uses half the physical cores, capped at 4; resource-saving mode stays at 2.
+    assert(lite && lite.cores === 4, `Expected 4 cores for balanced mode on a 16-core machine; got ${lite && lite.cores}`);
     const save = doctor.liteProfile({ host, engine: { resourceMode: 'save' } });
-    assert(save.cores === 2, `省资源模式应固定 2 核，实际 ${save.cores}`);
-    assert(doctor.liteProfile({ host, engine: { liteMode: false } }) === null, '显式关闭应返回 null');
+    assert(save.cores === 2, `Resource-saving mode should use 2 cores; got ${save.cores}`);
+    assert(doctor.liteProfile({ host, engine: { liteMode: false } }) === null, 'Explicitly disabling this option should return null');
     const low = doctor.liteProfile({ host: { ...host, cores: 2 }, engine: {} });
-    assert(low.cores === 2, '2 核机器至少保留 2 核');
+    assert(low.cores === 2, 'Keep at least 2 cores on a 2-core machine');
 
     const auto = doctor.autoProfile({
       settings: { engine: { autoMemory: true, liteMode: true } },
@@ -790,11 +790,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       settings: { engine: { autoMemory: false, cores: 6, liteMode: true } },
       accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 100000,
     });
-    assert(manual.cores === 6, '用户手动指定的核数必须优先于轻量模式');
-    assert(/轻量容器/.test(doctor.describeProfile(auto)), '诊断摘要应标出轻量容器');
+    assert(manual.cores === 6, 'User-selected core count must take precedence over lightweight mode');
+    assert(/Lite container/.test(doctor.describeProfile(auto)), 'The profile summary should identify lightweight mode');
   });
 
-  await test('全局鼠标钩子默认关闭，且窗口代理不再长时间阻塞消息泵', () => {
+  await test('Global mouse hook is disabled by default and the window agent no longer blocks the message pump', () => {
     const root = path.join(__dirname, '..');
     const agentPs1 = fs.readFileSync(path.join(root, 'src', 'core', 'win', 'agent.ps1'), 'utf8');
     const agentJs = fs.readFileSync(path.join(root, 'src', 'core', 'agent.js'), 'utf8');
@@ -803,72 +803,72 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const storeJs = fs.readFileSync(path.join(root, 'src', 'core', 'store.js'), 'utf8');
     const uiHtml = fs.readFileSync(path.join(root, 'src', 'ui', 'index.html'), 'utf8');
 
-    assert(/mouseSideButtons:\s*false/.test(storeJs), '默认设置里侧键钩子必须关闭');
-    assert(!/winAgent\.hook\(true\)/.test(mainJs), '主进程不能再无条件安装全局钩子');
-    assert(!/agent\.hook\(true\)/.test(appwinJs), '应用窗口不能再无条件安装全局钩子');
-    assert(!/sharer\.start\(8000\)/.test(mainJs), '文件同步不能无条件常驻');
-    assert(/setHook/.test(agentJs) && /hooked/.test(agentJs), '钩子开关必须幂等可关闭');
-    assert(/new Thread\(HookThreadProc\)/.test(agentPs1), '钩子必须装在专用消息线程上');
-    assert(/GetMessage\(out MSG/.test(agentPs1), '钩子线程必须跑消息循环');
-    assert(!/Poll\(4000,\s*SelectMode\.SelectRead\)/.test(agentPs1), '主循环不能再阻塞 4 秒');
-    assert(/Poll\(50,\s*SelectMode\.SelectRead\)/.test(agentPs1), '主循环应短轮询保持消息泵响应');
-    assert(/now - _embedAt < 8000/.test(agentPs1), '窗口巡检必须限时，不能永久每 2 秒 EnumWindows');
-    assert(/setLiteMode/.test(uiHtml) && /setDeepTrim/.test(uiHtml), '设置页需暴露轻量容器选项');
+    assert(/mouseSideButtons:\s*false/.test(storeJs), 'The side-button hook must be disabled by default');
+    assert(!/winAgent\.hook\(true\)/.test(mainJs), 'The main process must not install the global hook unconditionally');
+    assert(!/agent\.hook\(true\)/.test(appwinJs), 'App windows must not install the global hook unconditionally');
+    assert(!/sharer\.start\(8000\)/.test(mainJs), 'File synchronization must not run persistently without a condition');
+    assert(/setHook/.test(agentJs) && /hooked/.test(agentJs), 'Hook enable/disable must be idempotent');
+    assert(/new Thread\(HookThreadProc\)/.test(agentPs1), 'The hook must run on a dedicated message thread');
+    assert(/GetMessage\(out MSG/.test(agentPs1), 'The hook thread must run a message loop');
+    assert(!/Poll\(4000,\s*SelectMode\.SelectRead\)/.test(agentPs1), 'The main loop must not block for four seconds');
+    assert(/Poll\(50,\s*SelectMode\.SelectRead\)/.test(agentPs1), 'Use short polling to keep the message pump responsive');
+    assert(/now - _embedAt < 8000/.test(agentPs1), 'Limit window scanning; do not call EnumWindows every two seconds indefinitely');
+    assert(/setLiteMode/.test(uiHtml) && /setDeepTrim/.test(uiHtml), 'Settings must expose lightweight-container options');
   });
 
-  await test('WinAgent.setHook(false) 在默认状态下不会拉起 PowerShell 代理', async () => {
+  await test('WinAgent.setHook(false) does not launch the PowerShell agent when disabled by default', async () => {
     const { WinAgent } = require('../src/core/agent');
     const a = new WinAgent();
     a.hooked = false;
     const r = await a.setHook(false);
-    assert(r && r.hooked === false, '关闭应返回 hooked=false');
-    assert(a.ready === null, '默认关闭时不能为此启动常驻代理进程');
+    assert(r && r.hooked === false, 'Disabling should return hooked=false');
+    assert(a.ready === null, 'When disabled by default, do not launch a persistent agent process');
   });
 
-  console.log('\n[鼠标键位映射]');
+  console.log('\n[mouse and key mapping]');
 
-  await test('默认与旧配置迁移：右键返回 + 平滑滚轮开启，侧键关闭', () => {
+  await test('Defaults and legacy migration: right-click back and smooth scrolling on; side buttons off', () => {
     const store = require('../src/core/store');
     const d = pointer.pointerOptions(store.getSettings());
-    assert(d.rightBack === true, '右键返回默认开');
-    assert(d.wheel === 'smooth', '滚轮默认平滑');
-    assert(d.side === false, '侧键默认关');
-    assert(d.enabled === true, '至少右键映射需要钩子');
-    // 老 settings.json 里没有新键时也要得到同样的结果
+    assert(d.rightBack === true, 'Right-click back is enabled by default');
+    assert(d.wheel === 'smooth', 'Smooth scrolling is enabled by default');
+    assert(d.side === false, 'Side buttons are disabled by default');
+    assert(d.enabled === true, 'The right-click mapping requires the hook');
+    // Legacy settings.json files without the new keys should get the same defaults.
     assert(pointer.pointerOptions({ engine: { liteMode: true } }).rightBack === true);
     const off = pointer.pointerOptions({ engine: { mouseRightBack: false, mouseWheelMode: 'off', mouseSideButtons: false } });
-    assert(off.enabled === false, '全部关掉后不应再装钩子');
+    assert(off.enabled === false, 'Do not install the hook when all mappings are disabled');
     const native = pointer.pointerOptions({ engine: { mouseRightBack: false, mouseWheelMode: 'native', mouseSideButtons: false } });
-    assert(native.enabled === false, '原生滚轮不需要钩子');
+    assert(native.enabled === false, 'Native scrolling does not need a hook');
   });
 
-  await test('hookOptions 收敛配置，关闭时所有子开关一起归零', () => {
+  await test('hookOptions normalizes configuration and clears all sub-options when disabled', () => {
     const on = pointer.hookOptions({ enabled: true, rightBack: true, wheel: true, side: false });
     assert(on.rightBack && on.wheel && !on.side);
     const off = pointer.hookOptions({ enabled: false, rightBack: true, wheel: true, side: true });
-    assert(!off.rightBack && !off.wheel && !off.side, 'enabled=false 必须彻底不拦事件');
-    assert(pointer.hookOptions(true).side === true, '兼容旧布尔写法（侧键）');
+    assert(!off.rightBack && !off.wheel && !off.side, 'enabled=false must not intercept any events');
+    assert(pointer.hookOptions(true).side === true, 'Support the legacy boolean form (side buttons)');
     assert(pointer.hookOptions(false).enabled === false);
   });
 
-  await test('滚轮方向：向下滚=手指上滑，向上滚=手指下滑，坐标不越界', () => {
+  await test('Wheel direction: down scroll maps to finger up; up scroll maps to finger down; coordinates stay in bounds', () => {
     const down = pointer.wheelToSwipe({ dy: -120, nx: 0.5, ny: 0.5, width: 900, height: 1600 });
-    assert(down && down.y1 > down.y2, '滚轮向下应让内容上移（手指上滑）');
+    assert(down && down.y1 > down.y2, 'Scrolling down should move content up (finger swipe up)');
     const up = pointer.wheelToSwipe({ dy: 120, nx: 0.5, ny: 0.5, width: 900, height: 1600 });
-    assert(up && up.y1 < up.y2, '滚轮向上应让内容下移（手指下滑）');
-    assert(pointer.wheelToSwipe({ dx: 0, dy: 0 }) === null, '零位移不产生命令');
+    assert(up && up.y1 < up.y2, 'Scrolling up should move content down (finger swipe down)');
+    assert(pointer.wheelToSwipe({ dx: 0, dy: 0 }) === null, 'Zero movement must not produce a command');
     for (const s of [down, up]) {
-      assert([s.x1, s.x2].every((v) => v >= 1 && v <= 899), 'x 不能越界');
-      assert([s.y1, s.y2].every((v) => v >= 1 && v <= 1599), 'y 不能越界');
-      assert(s.duration >= 100 && s.duration <= 240, '滑动时长应有上限');
+      assert([s.x1, s.x2].every((v) => v >= 1 && v <= 899), 'x coordinate is out of bounds');
+      assert([s.y1, s.y2].every((v) => v >= 1 && v <= 1599), 'y coordinate is out of bounds');
+      assert(s.duration >= 100 && s.duration <= 240, 'Swipe duration should be capped');
     }
     const big = pointer.wheelToSwipe({ dy: -12000, nx: 0, ny: 0, width: 900, height: 1600 });
-    assert(big.y1 - big.y2 <= Math.round(1600 * 0.78), '快滚不能无限拉长手势');
+    assert(big.y1 - big.y2 <= Math.round(1600 * 0.78), 'Fast scrolling must not produce an unbounded swipe');
     const horiz = pointer.wheelToSwipe({ dx: 120, dy: 0, width: 900, height: 1600 });
-    assert(horiz && horiz.x1 > horiz.x2 && horiz.y1 === horiz.y2, '横向滚轮应产生水平滑动');
+    assert(horiz && horiz.x1 > horiz.x2 && horiz.y1 === horiz.y2, 'Horizontal wheel input should produce a horizontal swipe');
   });
 
-  await test('input 命令白名单：只放行内部拼出的命令，挡住注入', async () => {
+  await test('input command allowlist permits only internally generated commands and blocks injection', async () => {
     assert(pointer.isInputCommand('input keyevent 4'));
     assert(pointer.isInputCommand(pointer.swipeToCommand(pointer.wheelToSwipe({ dy: -120 }))));
     assert(!pointer.isInputCommand('input keyevent 4; rm -rf /sdcard'));
@@ -876,27 +876,27 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(!pointer.isInputCommand('sh -c anything'));
     const c = new AdbClient({ adbPath: 'adb', serial: 'test' });
     let blocked = false;
-    try { await c.input('input keyevent 4; rm -rf /'); } catch (e) { blocked = /非法/.test(e.message); }
-    assert(blocked, '非法命令必须在拉起 adb 之前被挡下');
-    assert(c._input === null, '被挡下的命令不能创建常驻会话');
+    try { await c.input('input keyevent 4; rm -rf /'); } catch (e) { blocked = /Invalid input command/i.test(e.message); }
+    assert(blocked, 'Reject invalid commands before launching adb');
+    assert(c._input === null, 'A rejected command must not create a persistent session');
   });
 
-  await test('返回键优先走常驻输入通道，失败才回退一次性 adb', async () => {
+  await test('Use the persistent input channel for Back first; fall back to one-shot adb only on failure', async () => {
     const c = new AdbClient({ adbPath: 'adb', serial: 'test' });
     const used = [];
     c.input = async (cmd) => { used.push(cmd); };
     c.shell = async () => { used.push('shell'); };
     await c.keyBack();
-    assert(used[0] === 'input keyevent 4' && !used.includes('shell'), '正常路径不应 spawn adb');
+    assert(used[0] === 'input keyevent 4' && !used.includes('shell'), 'The normal path should not spawn adb');
     const c2 = new AdbClient({ adbPath: 'adb', serial: 'test' });
     const used2 = [];
     c2.input = async () => { throw new Error('offline'); };
     c2.shell = async (cmd) => { used2.push(cmd); return ''; };
     await c2.keyForward();
-    assert(used2[0] === 'input keyevent 125', '常驻通道失败必须兜底，别丢掉这次点击');
+    assert(used2[0] === 'input keyevent 125', 'Fall back when the persistent channel fails so the click is not lost');
   });
 
-  await test('WheelRouter 把连续滚动合并成一条滑动命令', async () => {
+  await test('WheelRouter merges consecutive scroll events into one swipe command', async () => {
     const cmds = [];
     const r = new pointer.WheelRouter({
       inject: async (cmd) => { cmds.push(cmd); },
@@ -907,71 +907,71 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     r.push({ dx: 0, dy: -120, nx: 0.5, ny: 0.5 });
     r.push({ dx: 0, dy: -120, nx: 0.5, ny: 0.4 });
     await r.flush();
-    assert(cmds.length === 1, `3 格滚动应合并成 1 条命令，实际 ${cmds.length}`);
-    assert(pointer.isInputCommand(cmds[0]), '必须产出合法的 input swipe');
+    assert(cmds.length === 1, `Expected three wheel ticks to merge into one command; got ${cmds.length}`);
+    assert(pointer.isInputCommand(cmds[0]), 'Must produce a valid input swipe command');
     const m = /^input swipe (\d+) (\d+) (\d+) (\d+)/.exec(cmds[0]);
-    assert(m && Number(m[2]) > Number(m[4]), '合并后仍是向下滚的方向');
+    assert(m && Number(m[2]) > Number(m[4]), 'The merged command must preserve downward-scroll direction');
     r.dispose();
     r.push({ dy: -120 });
     await r.flush();
-    assert(cmds.length === 1, 'dispose 后不能再注入');
+    assert(cmds.length === 1, 'Must not inject after dispose');
   });
 
-  await test('代理脚本：右键/滚轮拦截、滚轮合并、前台限定与专用线程', () => {
+  await test('Agent script: intercept right-click/wheel, merge wheel events, scope to the foreground, and use a dedicated thread', () => {
     const ps1 = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1'), 'utf8');
-    assert(/WM_RBUTTONDOWN/.test(ps1) && /WM_MOUSEWHEEL/.test(ps1), '必须处理右键与滚轮');
-    assert(/WM_MOUSEHWHEEL/.test(ps1), '横向滚轮也要支持');
-    assert(/PushWheel\(/.test(ps1) && /FlushWheel\(false\)/.test(ps1), '滚轮必须合并后上报');
-    assert(/GetAncestor\(fg, 2\)/.test(ps1), '必须按前台根窗口限定作用域');
-    assert(/new Thread\(HookThreadProc\)/.test(ps1) && /GetMessage\(out MSG/.test(ps1), '钩子必须在专用消息线程');
-    assert(!/Poll\(4000,\s*SelectMode\.SelectRead\)/.test(ps1), '主循环不能长阻塞');
-    assert(/_optRight == 0/.test(ps1) && /_optWheel == 0/.test(ps1), '未配置的映射不能拦事件');
+    assert(/WM_RBUTTONDOWN/.test(ps1) && /WM_MOUSEWHEEL/.test(ps1), 'Must handle right-click and vertical wheel events');
+    assert(/WM_MOUSEHWHEEL/.test(ps1), 'Must also support horizontal wheel events');
+    assert(/PushWheel\(/.test(ps1) && /FlushWheel\(false\)/.test(ps1), 'Wheel events must be merged before reporting');
+    assert(/GetAncestor\(fg, 2\)/.test(ps1), 'Scope input to the foreground root window');
+    assert(/new Thread\(HookThreadProc\)/.test(ps1) && /GetMessage\(out MSG/.test(ps1), 'The hook must run on a dedicated message thread');
+    assert(!/Poll\(4000,\s*SelectMode\.SelectRead\)/.test(ps1), 'The main loop must not block for long periods');
+    assert(/_optRight == 0/.test(ps1) && /_optWheel == 0/.test(ps1), 'Unconfigured mappings must not intercept events');
     const appwinJs = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
-    assert(/pointerConfig/.test(appwinJs) && /refreshPointer/.test(appwinJs), '设置变化要能即时同步钩子');
+    assert(/pointerConfig/.test(appwinJs) && /refreshPointer/.test(appwinJs), 'Settings changes must update the hook immediately');
     const uiHtml = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'index.html'), 'utf8');
-    assert(/setMouseRightBack/.test(uiHtml) && /setMouseWheelMode/.test(uiHtml), '设置页需暴露键位开关');
+    assert(/setMouseRightBack/.test(uiHtml) && /setMouseWheelMode/.test(uiHtml), 'Settings must expose the input-mapping controls');
   });
 
-  await test('WinAgent.setHook 把键位配置一起下发，且关闭时不拉起代理', async () => {
+  await test('WinAgent.setHook sends input mappings and does not launch the agent when disabling', async () => {
     const { WinAgent } = require('../src/core/agent');
     const a = new WinAgent();
     const sent = [];
     a.call = async (obj) => { sent.push(obj); return { ok: true, hooked: true }; };
     const on = await a.setHook(true, { rightBack: true, wheel: true, side: false });
-    assert(on.hooked === true && sent.length === 1, '开启应只发一次命令');
-    assert(sent[0].right === 1 && sent[0].wheel === 1 && sent[0].side === 0, '配置必须随 hook 命令下发');
+    assert(on.hooked === true && sent.length === 1, 'Enabling should send exactly one command');
+    assert(sent[0].right === 1 && sent[0].wheel === 1 && sent[0].side === 0, 'Configuration must be sent with the hook command');
     await a.setHook(false);
-    assert(sent[1].on === 0 && a.hooked === false, '关闭要卸载钩子');
+    assert(sent[1].on === 0 && a.hooked === false, 'Disabling must uninstall the hook');
     const b = new WinAgent();
     const r = await b.setHook(false);
-    assert(r.hooked === false && b.ready === null, '默认关闭时不能启动 PowerShell');
+    assert(r.hooked === false && b.ready === null, 'Do not start PowerShell when the hook is disabled by default');
   });
 
-  console.log('\n[updater.js 在线更新]');
-  await test('版本比较按数字逐段比，v 前缀 / 多段都正确', () => {
+  console.log('\n[updater.js online updates]');
+  await test('Compare version segments numerically; support a v prefix and multiple segments', () => {
     const { cmpVer } = require('../src/core/updater');
-    assert(cmpVer('v0.3.2', '0.3.1') === 1, '0.3.2 应大于 0.3.1');
-    assert(cmpVer('0.3.1', 'v0.3.1') === 0, 'v 前缀不影响相等');
-    assert(cmpVer('0.10.0', '0.9.9') === 1, '必须按数字比而不是字符串比');
-    assert(cmpVer('1.0.0', '1.0.1') === -1, '1.0.0 小于 1.0.1');
+    assert(cmpVer('v0.3.2', '0.3.1') === 1, '0.3.2 should be greater than 0.3.1');
+    assert(cmpVer('0.3.1', 'v0.3.1') === 0, 'A v prefix should not affect equality');
+    assert(cmpVer('0.10.0', '0.9.9') === 1, 'Compare numerically, not lexicographically');
+    assert(cmpVer('1.0.0', '1.0.1') === -1, '1.0.0 is less than 1.0.1');
   });
 
-  await test('安装形态决定挑哪个资产：安装版=Setup.exe，便携版=portable.zip', () => {
+  await test('Select the update asset based on package type: Setup.exe for installer, portable.zip for portable', () => {
     const { Updater } = require('../src/core/updater');
     const dir = path.join(TMP, 'upd-setup');
     fs.mkdirSync(dir, { recursive: true });
     const exe = path.join(dir, 'ApkStart.exe');
     fs.writeFileSync(exe, 'x');
     const portable = new Updater({ currentVersion: '0.1.0', exePath: exe, isPackaged: true, dataDir: TMP });
-    assert(portable.flavor === 'portable', '没有卸载器时判定为便携版');
+    assert(portable.flavor === 'portable', 'Classify as portable when no uninstaller is present');
     fs.writeFileSync(path.join(dir, 'Uninstall ApkStart.exe'), 'x');
-    assert(portable.flavor === 'setup', '有卸载器时判定为安装版');
-    // 资产挑选是纯函数式的，这里直接喂一个假的 check 结果验证兜底命名规则
-    assert(/Setup\.exe$/i.test('ApkStart-0.3.2-Setup.exe'), '安装版资产名匹配');
-    assert(/portable.*\.zip$/i.test('ApkStart-v0.3.2-win64-portable.zip'), '便携版资产名匹配');
+    assert(portable.flavor === 'setup', 'Classify as installer when an uninstaller is present');
+    // Asset selection is a pure function; use a mock check result to validate fallback naming.
+    assert(/Setup\.exe$/i.test('ApkStart-0.3.2-Setup.exe'), 'Installer asset name matches');
+    assert(/portable.*\.zip$/i.test('ApkStart-v0.3.2-win64-portable.zip'), 'Portable asset name matches');
   });
 
-  await test('便携版不会把运行时整包（ApkStart-runtime-*.zip）当成更新包', async () => {
+  await test('Portable updater must not treat the full runtime bundle (ApkStart-runtime-*.zip) as an update package', async () => {
     const { Updater } = require('../src/core/updater');
     const dir = path.join(TMP, 'upd-asset');
     fs.mkdirSync(dir, { recursive: true });
@@ -982,59 +982,59 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       publishedAt: '', sources: [], unreachable: [], assets,
     });
     const u = new Updater({ currentVersion: '0.3.4', exePath: exe, isPackaged: true, dataDir: dir });
-    // 两个资产同时存在 → 必须挑便携包
+    // When both assets exist, choose the portable package.
     u.sources = { latest: async () => mk([
       { name: 'ApkStart-runtime-v0.5.0.zip', url: 'https://x/runtime.zip', urls: ['https://x/runtime.zip'], sizes: {} },
       { name: 'ApkStart-v0.5.0-win64-portable.zip', url: 'https://x/p.zip', urls: ['https://x/p.zip'], sizes: {} },
     ]) };
     let info = await u.check({ force: true });
-    assert(/portable/.test(info.asset.name), `应挑便携包，实际 ${info.asset.name}`);
+    assert(/portable/.test(info.asset.name), `Expected the portable package; got ${info.asset.name}`);
 
-    // 只有运行时整包（便携包没传上去）→ 宁可不自动更新，也不能拿 1.5GB 运行时当程序包
+    // If only the runtime bundle exists (portable upload missing), do not auto-update rather than using a 1.5 GB runtime as the app package.
     u.sources = { latest: async () => mk([
       { name: 'ApkStart-runtime-v0.5.0.zip', url: 'https://x/runtime.zip', urls: ['https://x/runtime.zip'], sizes: {} },
     ]) };
     info = await u.check({ force: true });
-    assert(!info.asset, '只有运行时整包时不应挑出更新资产');
-    assert(info.canAutoApply === false, '没有可用资产时不能自动更新');
+    assert(!info.asset, 'Do not select the runtime bundle as an update asset');
+    assert(info.canAutoApply === false, 'Do not auto-update when no valid asset is available');
   });
 
-  await test('双源：候选地址含镜像前缀，自定义前缀优先于公共镜像', () => {
+  await test('Dual sources: include mirror URLs and prefer a custom prefix over public mirrors', () => {
     const { Sources, withMirror } = require('../src/core/sources');
     const url = 'https://github.com/o/r/releases/download/v1/a.zip';
     const auto = new Sources(() => ({ runtime: { autoMirror: true } }));
     const list = auto.candidates(url);
-    assert(list[0] === url, '源站必须排第一（测速排序前保持原序）');
-    assert(list.length >= 2 && list.some((u) => u.includes('ghfast.top')), '自动镜像应被列入候选');
+    assert(list[0] === url, 'The origin must be first before speed ranking');
+    assert(list.length >= 2 && list.some((u) => u.includes('ghfast.top')), 'Automatic mirrors should be candidates');
 
     const custom = new Sources(() => ({ runtime: { autoMirror: true, mirrorPrefix: 'https://my.mirror/' } }));
     const c2 = custom.candidates(url);
-    assert(c2.length === 2 && c2[1] === `https://my.mirror/${url}`, `自定义前缀应唯一生效，实际 ${JSON.stringify(c2)}`);
+    assert(c2.length === 2 && c2[1] === `https://my.mirror/${url}`, `Only the custom prefix should apply; got ${JSON.stringify(c2)}`);
 
     const off = new Sources(() => ({ runtime: { autoMirror: false } }));
-    assert(off.candidates(url).length === 1, '关掉自动镜像后只剩直连');
-    assert(withMirror(url, 'https://x/') === `https://x/${url}`, '前缀缺尾斜杠要自动补');
+    assert(off.candidates(url).length === 1, 'With automatic mirrors disabled, only the direct URL should remain');
+    assert(withMirror(url, 'https://x/') === `https://x/${url}`, 'Add a trailing slash to the prefix when missing');
 
-    // 镜像只代理 GitHub：Gitee 的地址拼上镜像前缀只会 403，不该被列入候选
+    // Mirrors proxy GitHub only; prefixing Gitee URLs returns 403, so do not include them.
     const giteeUrl = 'https://gitee.com/daily-miku/apkstart/releases/download/v1/a.zip.part1';
-    assert(auto.candidates(giteeUrl).length === 1, 'Gitee 资产不应套 GitHub 镜像前缀');
+    assert(auto.candidates(giteeUrl).length === 1, 'Do not prepend the GitHub mirror to Gitee assets');
   });
 
-  await test('双源：测速结果按速度排序，全部失败时保持原序不丢可用地址', async () => {
+  await test('Dual sources: rank by speed and preserve original order when all probes fail', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: { autoMirror: false } }));
-    // 直接注入测速缓存，避免测试依赖外网
+    // Inject the speed-test cache directly so the test does not depend on the internet.
     s._rankCache.set('https://slow/', { at: Date.now(), ok: true, speed: 1000 });
     s._rankCache.set('https://fast/', { at: Date.now(), ok: true, speed: 9000 });
     s._rankCache.set('https://dead/', { at: Date.now(), ok: false, speed: 0 });
     const ranked = await s.rank(['https://slow/', 'https://dead/', 'https://fast/']);
-    assert(ranked[0] === 'https://fast/', `最快的应排第一，实际 ${ranked[0]}`);
-    assert(ranked[2] === 'https://dead/', '失败的地址排最后但仍保留（还有一次机会）');
+    assert(ranked[0] === 'https://fast/', `Expected the fastest URL first; got ${ranked[0]}`);
+    assert(ranked[2] === 'https://dead/', 'Put failed URLs last but keep them for another attempt');
     s.reset();
-    assert(s._rankCache.size === 0, 'reset 要清空测速缓存（换源/换网后必须重测）');
+    assert(s._rankCache.size === 0, 'reset must clear speed-test results so sources are retested after a network change');
   });
 
-  await test('双源：Gitee 自动附带的源码包（v1.2.3.zip）绝不能被当成安装包', async () => {
+  await test('Dual sources: never treat Gitee’s automatically attached source archive (v1.2.3.zip) as an installer', async () => {
     const { Sources } = require('../src/core/sources');
     const s2 = new Sources(() => ({ runtime: {} }));
     s2.fetchReleases = async () => [
@@ -1054,10 +1054,10 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     ];
     const m = await s2.latest();
     assert(m.assets.length === 1 && m.assets[0].url === 'ge://ok',
-      `只应保留 ApkStart* 资产，实际 ${JSON.stringify(m.assets.map((a) => a.name))}`);
+      `Only ApkStart* assets should remain; got ${JSON.stringify(m.assets.map((a) => a.name))}`);
   });
 
-  await test('Gitee 的资产没有 size 字段：分片组仍要成立（否则整包被丢掉）', async () => {
+  await test('Gitee assets have no size field; retain split groups or the whole package will be discarded', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: {} }));
     s.fetchReleases = async () => [{
@@ -1066,7 +1066,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       web: 'e',
       rel: {
         tag_name: 'v0.3.3',
-        // Gitee 发行版资产只有 name + url，没有 size（实测）
+        // Gitee release assets include name and URL only, no size (observed).
         assets: [
           { name: 'ApkStart-v0.3.3-win64-portable.zip.part1', browser_download_url: 'ge://p1' },
           { name: 'ApkStart-v0.3.3-win64-portable.zip.part2', browser_download_url: 'ge://p2' },
@@ -1074,15 +1074,15 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       },
     }];
     const m = await s.latest();
-    assert(m.assets.length === 1, `应合并成 1 个资产，实际 ${m.assets.length}`);
+    assert(m.assets.length === 1, `Expected one merged asset; got ${m.assets.length}`);
     const a = m.assets[0];
-    assert(a.name === 'ApkStart-v0.3.3-win64-portable.zip', `资产名应为整包名，实际 ${a.name}`);
-    assert(a.parts && a.parts.length === 2, '必须保留两片');
-    assert(a.parts[0].urls[0] === 'ge://p1' && a.parts[1].urls[0] === 'ge://p2', '分片地址顺序/内容要对');
-    assert(a.size === 0, '大小未知时应为 0（界面按已收字节显示进度）');
+    assert(a.name === 'ApkStart-v0.3.3-win64-portable.zip', `Expected the full-package asset name; got ${a.name}`);
+    assert(a.parts && a.parts.length === 2, 'Both parts must be retained');
+    assert(a.parts[0].urls[0] === 'ge://p1' && a.parts[1].urls[0] === 'ge://p2', 'Split-part URLs and order must match');
+    assert(a.size === 0, 'Use zero for unknown size (the UI reports progress from bytes received)');
   });
 
-  await test('分片资产必须一路传到 updater.asset，否则 prepare 会报「没有可用的下载地址」', async () => {
+  await test('Split assets must be retained through updater.asset or prepare reports “no usable download URL”', async () => {
     const { Updater } = require('../src/core/updater');
     const u = new Updater({
       currentVersion: '0.0.1', exePath: path.join(TMP, 'A.exe'), isPackaged: true, dataDir: TMP,
@@ -1101,11 +1101,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       unreachable: [],
     });
     const info = await u.check({ force: true });
-    assert(info.asset && info.asset.parts && info.asset.parts.length === 2, 'parts 必须保留到 asset 上');
-    assert(info.canAutoApply === true, '有分片就应判定为可自动更新');
+    assert(info.asset && info.asset.parts && info.asset.parts.length === 2, 'parts must remain attached to the asset');
+    assert(info.canAutoApply === true, 'Assets with split parts should be eligible for automatic updates');
   });
 
-  await test('双源：合并版本时只认同版本的资产，不拿旧包冒充新包', async () => {
+  await test('Dual sources: when merging releases, use only assets from that version; never substitute an old package', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: {} }));
     s.fetchReleases = async () => [
@@ -1113,49 +1113,49 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       { source: 'gitee', name: 'Gitee', web: 'e', rel: { tag_name: 'v0.3.9', assets: [{ name: 'ApkStart-A-portable.zip', size: 10, browser_download_url: 'ge://a' }, { name: 'ApkStart-B.txt', size: 1, browser_download_url: 'ge://b' }] } },
     ];
     const m = await s.latest();
-    assert(m.version === '0.4.0', `应取更高版本，实际 ${m.version}`);
-    assert(m.assets.length === 1 && m.assets[0].url === 'gh://a', '旧版本同名资产不能覆盖新版本');
+    assert(m.version === '0.4.0', `Expected the higher version; got ${m.version}`);
+    assert(m.assets.length === 1 && m.assets[0].url === 'gh://a', 'A same-named asset from an older release must not replace the current asset');
   });
 
-  await test('窗口代理：scope 用分号拼目录、滤空项（窗口归属判定的唯一输入）', async () => {
+  await test('Window agent: scope directories with semicolons and filter empty entries (the sole input for window ownership)', async () => {
     const { WinAgent } = require('../src/core/agent');
     const a = new WinAgent();
     const sent = [];
-    // 不真起代理进程：只验证发给它的协议内容
+    // Do not launch the agent; validate only the protocol payload.
     a.call = async (obj) => { sent.push(obj); return { ok: true, n: 1 }; };
     const r = await a.scope(['C:////runtime', '', null, 'D:////repo////engine']);
-    assert(sent.length === 1 && sent[0].cmd === 'scope', `只应发一条 scope，实际 ${JSON.stringify(sent)}`);
-    assert(sent[0].dirs === 'C:////runtime;D:////repo////engine', `空项要滤掉，实际 ${sent[0].dirs}`);
-    assert(r.ok === true, 'scope 成功要返回 ok');
-    // 传空数组也不能抛：那等于「什么都不压制」，由调用方决定要不要告警
+    assert(sent.length === 1 && sent[0].cmd === 'scope', `Expected one scope command; got ${JSON.stringify(sent)}`);
+    assert(sent[0].dirs === 'C:////runtime;D:////repo////engine', `Empty entries should be filtered; got ${sent[0].dirs}`);
+    assert(r.ok === true, 'A successful scope command should return ok');
+    // An empty array must not throw: it means “suppress nothing,” and the caller decides whether to warn.
     const empty = await a.scope([]);
-    assert(sent[1].dirs === '' && empty.ok === true, '空范围也要能下发（代理收到后一个窗口都不动）');
+    assert(sent[1].dirs === '' && empty.ok === true, 'Allow an empty scope (the agent then leaves all windows untouched)');
   });
 
-  await test('双源：同名整包两边都有时，两个地址都要留着（否则 Gitee 永远轮不到）', async () => {
+  await test('Dual sources: retain both URLs for same-named full packages or Gitee will never be tried', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: { autoMirror: false } }));
     const gh = 'https://github.com/o/r/releases/download/v0.3.3/a.zip';
     const ge = 'https://gitee.com/o/r/releases/download/v0.3.3/a.zip';
     s.fetchReleases = async () => [
       { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v0.3.3', assets: [{ name: 'ApkStart-v0.3.3-win64-portable.zip', size: 108200693, browser_download_url: gh }] } },
-      // Gitee 的资产没有 size（实测），不能拿 GitHub 的大小冒充它
+      // Gitee assets have no size (observed); do not copy the GitHub size.
       { source: 'gitee', name: 'Gitee', web: 'e', rel: { tag_name: 'v0.3.3', assets: [{ name: 'ApkStart-v0.3.3-win64-portable.zip', browser_download_url: ge }] } },
     ];
     const m = await s.latest();
-    assert(m.assets.length === 1, `同名资产要合并成 1 个，实际 ${m.assets.length}`);
+    assert(m.assets.length === 1, `Expected one merged asset with the same name; got ${m.assets.length}`);
     const a = m.assets[0];
-    assert(a.urls.length === 2 && a.urls[1] === ge, `两个源的地址都要留着，实际 ${JSON.stringify(a.urls)}`);
-    assert(a.sizes[gh] === 108200693 && !a.sizes[ge], '大小按地址分开记，未知就是未知');
+    assert(a.urls.length === 2 && a.urls[1] === ge, `Keep URLs for both sources; got ${JSON.stringify(a.urls)}`);
+    assert(a.sizes[gh] === 108200693 && !a.sizes[ge], 'Track sizes per URL; unknown remains unknown');
     const cands = s.candidates(a);
-    assert(cands.length === 2 && cands[0] === gh, `候选地址应含两个源，实际 ${JSON.stringify(cands)}`);
+    assert(cands.length === 2 && cands[0] === gh, `Expected both source URLs; got ${JSON.stringify(cands)}`);
   });
 
-  await test('多源并行下载：两个源体积不同时，跟最快的源走（不能固定挑体积大的）', async () => {
+  await test('Multi-source download: when source sizes differ, use the fastest source rather than always choosing the larger one', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const MB = 1024 * 1024;
-    const small = Buffer.alloc(3 * MB);   // 排在前面的源（已按速度排好序）
+    const small = Buffer.alloc(3 * MB);   // Source listed first (already sorted by speed)
     const big = Buffer.alloc(5 * MB);
     for (let i = 0; i < small.length; i += 1) small[i] = i % 251;
     for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 251;
@@ -1178,18 +1178,18 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const s2 = await mk(big);
     const out = path.join(TMP, 'mixed-size.bin');
     try {
-      // 列表顺序 = rank() 的速度序：第一个就是最快的源
+      // The list is ordered by rank() speed; the first source is fastest.
       await downloadMulti([`http://127.0.0.1:${s1.address().port}/f`, `http://127.0.0.1:${s2.address().port}/f`], out, { connections: 4 });
       const got = fs.readFileSync(out);
       assert(got.length === small.length && Buffer.compare(got, small) === 0,
-        `应下最快的源那一份（${small.length} 字节），实际 ${got.length} 字节`);
+        `Expected the fastest source’s ${small.length} bytes; got ${got.length} bytes`);
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
     }
   });
 
-  await test('分片更新包：按顺序拼回整包，大小不符立刻中止', async () => {
+  await test('Split update package is reassembled in order and aborted immediately on size mismatch', async () => {
     const http = require('http');
     const { Updater } = require('../src/core/updater');
     const partA = Buffer.alloc(4096, 0x41);
@@ -1215,16 +1215,16 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
         ],
       }, target, 2, partA.length + partB.length);
       const got = fs.readFileSync(target);
-      assert(got.length === partA.length + partB.length, '拼装后大小必须等于各分片之和');
-      assert(got.slice(0, partA.length).every((b) => b === 0x41), '第一片内容顺序错误');
-      assert(got.slice(partA.length).every((b) => b === 0x42), '第二片内容顺序错误');
+      assert(got.length === partA.length + partB.length, 'Reassembled size must equal the sum of the parts');
+      assert(got.slice(0, partA.length).every((b) => b === 0x41), 'First part is in the wrong order');
+      assert(got.slice(partA.length).every((b) => b === 0x42), 'Second part is in the wrong order');
     } finally {
       srv.close();
       fs.rmSync(sb, { recursive: true, force: true });
     }
   });
 
-  await test('多源并行下载：不同分块从不同源拉，拼出来的字节必须完全一致', async () => {
+  await test('Multi-source download: fetch chunks from different sources and reconstruct the exact original bytes', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const data = Buffer.alloc(3 * 1024 * 1024);
@@ -1240,7 +1240,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       });
       res.end(data.slice(a, b + 1));
     };
-    // 显式等 listening 回调：先 listen 再挂事件监听会漏掉已经触发的事件，测试会挂住
+    // Wait for the listening callback explicitly; attaching the listener after listen can miss the event and hang the test.
     const mk = () => new Promise((resolve) => {
       const srv = http.createServer(handler);
       srv.listen(0, '127.0.0.1', () => resolve(srv));
@@ -1255,16 +1255,16 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     try {
       const r = await downloadMulti(urls, out, { connections: 6, minChunk: 512 * 1024 });
       const got = fs.readFileSync(out);
-      assert(Buffer.compare(got, data) === 0, '多源拼装后内容必须与源文件完全一致');
-      assert(r.sources === 2 && r.parallel >= 2, `应同时用到 2 个源，实际 ${JSON.stringify(r)}`);
-      assert(got.length === data.length, '大小必须一致');
+      assert(Buffer.compare(got, data) === 0, 'Reconstructed multi-source file must exactly match the original');
+      assert(r.sources === 2 && r.parallel >= 2, `Expected two sources to be used; got ${JSON.stringify(r)}`);
+      assert(got.length === data.length, 'File size must match');
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
     }
   });
 
-  await test('多源并行下载：失败后重来只补缺的块（不重下整个 1.4GB）', async () => {
+  await test('Multi-source download resumes only missing chunks (does not redownload the full 1.4 GB)', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const MB = 1024 * 1024;
@@ -1277,11 +1277,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       if (!r) { res.writeHead(200, { 'Content-Length': total }); res.end(data); return; }
       const a = Number(r[1]);
       const b = Math.min(Number(r[2]), total - 1);
-      if (b > a) ranged += 1;          // 只统计真正的数据块请求（探测用 0-0 不算）
+      if (b > a) ranged += 1;          // Count only actual data chunks (exclude the 0-0 probe).
       res.writeHead(206, { 'Content-Range': `bytes ${a}-${b}/${total}`, 'Content-Length': b - a + 1 });
       res.end(data.slice(a, b + 1));
     };
-    // 必须是两条地址：只有一条时 downloadMulti 会直接交给单源分块（那条路径自带续传）
+    // Use two URLs; with one URL, downloadMulti delegates to the single-source chunked downloader, which already supports resume.
     const mk = () => new Promise((resolve) => {
       const srv = http.createServer(handler);
       srv.listen(0, '127.0.0.1', () => resolve(srv));
@@ -1291,7 +1291,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const urls = [`http://127.0.0.1:${s1.address().port}/f`, `http://127.0.0.1:${s2.address().port}/f`];
     const out = path.join(TMP, 'multi-resume.bin');
     try {
-      // 造出「前两块已下完、最后一块没下」的现场（分块方式：3 连接 × 1MB）
+      // Simulate the first two chunks downloaded and the last missing (3 connections × 1 MB).
       const per = Math.ceil(total / 3);
       const fd = fs.openSync(out, 'w');
       fs.ftruncateSync(fd, total);
@@ -1300,10 +1300,10 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       fs.writeFileSync(`${out}.chunks.json`, JSON.stringify({ total, n: 3, done: [0, per] }));
 
       const r = await downloadMulti(urls, out, { connections: 3, minChunk: MB });
-      assert(r.resumed === true, '应识别出这是断点续传');
-      assert(ranged === 1, `只应补下 1 个块，实际请求 ${ranged} 块`);
-      assert(Buffer.compare(fs.readFileSync(out), data) === 0, '续传后的文件必须与源完全一致');
-      assert(!fs.existsSync(`${out}.chunks.json`), '完成后要清掉边车文件');
+      assert(r.resumed === true, 'Expected the download to resume');
+      assert(ranged === 1, `Expected to fetch one missing chunk; requested ${ranged}`);
+      assert(Buffer.compare(fs.readFileSync(out), data) === 0, 'Resumed file must exactly match the source');
+      assert(!fs.existsSync(`${out}.chunks.json`), 'Remove the sidecar file after completion');
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
@@ -1311,18 +1311,18 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     }
   });
 
-  await test('下载器：连接建立后一个字节都不来，必须超时换源而不是挂死', async () => {
+  await test('Downloader: if a connection sends no data, time out and switch sources instead of hanging', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const data = Buffer.alloc(4 * 1024 * 1024, 9);
-    // 头正常回、然后一直不说话：模拟「TCP 通但被墙/被限速」的经典状态
+    // Return valid headers, then stall: simulate a TCP connection that is blocked or throttled.
     const stall = http.createServer((req, res) => {
       const r = /bytes=(\d+)-(\d+)/.exec(req.headers.range || '');
       if (!r) { res.writeHead(200, { 'Content-Length': data.length }); res.end(data); return; }
       const a = Number(r[1]);
       const b = Math.min(Number(r[2]), data.length - 1);
       res.writeHead(206, { 'Content-Range': `bytes ${a}-${b}/${data.length}`, 'Content-Length': b - a + 1 });
-      // 先给 1KB，然后不再发任何东西
+      // Send 1 KB, then stop sending data.
       res.write(data.slice(a, a + 1024));
     });
     const good = http.createServer((req, res) => {
@@ -1345,8 +1345,8 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
         { connections: 4, minChunk: 1024 * 1024, idleMs: 400, retries: 2 },
       );
       const cost = Date.now() - t0;
-      assert(fs.statSync(out).size === data.length, '最终必须下完整');
-      assert(cost < 15000, `不能在停滞的连接上挂住，实际用了 ${cost}ms`);
+      assert(fs.statSync(out).size === data.length, 'The complete file must eventually download');
+      assert(cost < 15000, `Must not hang on a stalled connection; elapsed ${cost} ms`);
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
@@ -1354,13 +1354,13 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     }
   });
 
-  await test('下载器：某个源只跑到几十 KB/s 时换源，而不是卡在最后几 % 不动', async () => {
+  await test('Downloader switches sources when one is limited to tens of KB/s instead of stalling near completion', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const MB = 1024 * 1024;
     const total = 2 * MB;
     const data = Buffer.alloc(total, 5);
-    // 慢源：每 100ms 才吐 4KB（≈40KB/s）
+    // Slow source: sends only 4 KB every 100 ms (about 40 KB/s).
     const slow = http.createServer((req, res) => {
       const r = /bytes=(\d+)-(\d+)/.exec(req.headers.range || '');
       if (!r) { res.writeHead(200, { 'Content-Length': total }); res.end(data); return; }
@@ -1397,9 +1397,9 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
         { connections: 2, minChunk: 512 * 1024, idleMs: 3000, slowAfterMs: 400, slowBps: 200 * 1024 },
       );
       const cost = Date.now() - t0;
-      assert(Buffer.compare(fs.readFileSync(out), data) === 0, '换源后内容必须正确');
-      // 全程走慢源的话 2MB / 40KB/s ≈ 50 秒；换源必须在几秒内完成
-      assert(cost < 15000, `应在低速时换源，实际用了 ${cost}ms`);
+      assert(Buffer.compare(fs.readFileSync(out), data) === 0, 'Content must be correct after switching sources');
+      // Using the slow source for 2 MB at 40 KB/s would take about 50 seconds; switching should finish in a few seconds.
+      assert(cost < 15000, `Expected a source switch at low speed; elapsed ${cost} ms`);
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
@@ -1407,7 +1407,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     }
   });
 
-  await test('多源并行下载：只有一条可用地址时退回单源分块', async () => {
+  await test('Multi-source download falls back to single-source chunking when only one URL is available', async () => {
     const http = require('http');
     const { downloadMulti } = require('../src/core/download');
     const data = Buffer.alloc(2 * 1024 * 1024, 7);
@@ -1421,24 +1421,24 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     });
     await new Promise((r) => srv.listen(0, '127.0.0.1', r));
     const url = `http://127.0.0.1:${srv.address().port}/f`;
-    // 拿一个「刚被释放、现在肯定没人监听」的端口当坏源，连接会立刻被拒而不是等超时
+    // Use a just-released port for the bad source so the connection is refused immediately instead of timing out.
     const probe = http.createServer(() => {});
     await new Promise((r) => probe.listen(0, '127.0.0.1', r));
     const deadPort = probe.address().port;
     await new Promise((r) => probe.close(r));
     const out = path.join(TMP, 'multi1.bin');
     try {
-      // 第二个地址故意指到不通的端口：必须自动忽略而不是整包失败
+      // Point the second URL at an unreachable port; ignore it instead of failing the whole download.
       const r = await downloadMulti([url, `http://127.0.0.1:${deadPort}/nope`], out, { connections: 4 });
-      assert(fs.statSync(out).size === data.length, '单源也要下完整');
-      assert(!r.multi || r.sources === 1, '可用源只有一个时不该标记为多源');
+      assert(fs.statSync(out).size === data.length, 'Single-source fallback must download the whole file');
+      assert(!r.multi || r.sources === 1, 'Do not mark as multi-source when only one source is available');
     } finally {
       srv.close();
       fs.rmSync(out, { force: true });
     }
   });
 
-  await test('双源：版本结果缓存 10 分钟，force 时强制重查', async () => {
+  await test('Dual sources: cache release results for 10 minutes and always recheck when forced', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: {} }));
     let calls = 0;
@@ -1448,15 +1448,15 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     };
     await s.latest();
     await s.latest();
-    assert(calls === 1, `缓存期内不应重复请求，实际请求 ${calls} 次`);
+    assert(calls === 1, `Should not request again while cached; got ${calls} requests`);
     await s.latest({ force: true });
-    assert(calls === 2, 'force 必须绕过缓存');
+    assert(calls === 2, 'force must bypass the cache');
     s.reset();
     await s.latest();
-    assert(calls === 3, 'reset 后应重新请求');
+    assert(calls === 3, 'Request again after reset');
   });
 
-  await test('双源：某个源 403 被限流后熔断跳过，不再每轮撞墙', async () => {
+  await test('Dual sources: circuit-break a source after a 403 rate limit instead of retrying every round', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: {} }));
     let giteeCalls = 0;
@@ -1464,38 +1464,38 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       giteeCalls += 1;
       return [
         { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v1.0.0', assets: [] } },
-        { source: 'gitee', name: 'Gitee', web: 'e', error: 'gitee.com 403 （被限流）' },
+        { source: 'gitee', name: 'Gitee', web: 'e', error: 'gitee.com 403 (rate limited)' },
       ];
     };
-    // 第一次：Gitee 报 403，被记入熔断
+    // First request: Gitee returns 403 and is circuit-broken.
     await s.latest({ force: true });
-    assert(giteeCalls === 1, '第一轮应真实请求过');
+    assert(giteeCalls === 1, 'The first round should make a real request');
     const reason = s.blockedReason('gitee');
-    assert(!!reason, '403 必须触发熔断');
-    assert(s.blockedReason('github') === null, '没出错的源不应被熔断');
-    // 熔断期内的请求应被直接跳过（不再打网络）
-    assert(/暂时跳过/.test(reason), `跳过原因要能看懂，实际：${reason}`);
+    assert(!!reason, 'A 403 must trigger the circuit breaker');
+    assert(s.blockedReason('github') === null, 'A source without errors must not be circuit-broken');
+    // Skip requests during the circuit-breaker window (do not access the network).
+    assert(/temporarily skipped/i.test(reason), `The circuit-breaker reason should be understandable: ${reason}`);
     s.reset();
-    assert(s.blockedReason('gitee') === null, 'reset 后熔断应解除');
+    assert(s.blockedReason('gitee') === null, 'reset must clear the circuit breaker');
   });
 
-  await test('双源：全部源不可达时退回上一次结果（标记 stale，不直接报错）', async () => {
+  await test('Dual sources: when all sources are unreachable, return the last result as stale instead of failing', async () => {
     const { Sources } = require('../src/core/sources');
     const s = new Sources(() => ({ runtime: {} }));
     s.fetchReleases = async () => [
       { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v1.2.3', assets: [] } },
     ];
     const first = await s.latest();
-    assert(first.tag === 'v1.2.3' && !first.stale, '第一次应正常');
-    s._relTtl = 0;   // 让缓存失效
+    assert(first.tag === 'v1.2.3' && !first.stale, 'First request should succeed');
+    s._relTtl = 0;   // Expire the cache.
     s.fetchReleases = async () => [
-      { source: 'github', name: 'GitHub', web: 'g', error: '超时' },
+      { source: 'github', name: 'GitHub', web: 'g', error: 'Timed out' },
     ];
     const second = await s.latest();
-    assert(second.tag === 'v1.2.3' && second.stale === true, '应退回旧结果并标记 stale');
+    assert(second.tag === 'v1.2.3' && second.stale === true, 'Expected the old result to be returned and marked stale');
   });
 
-  await test('系统镜像落点：全新安装必须落在运行时目录（CI 组装运行时靠这个）', () => {
+  await test('System image location: new installations must use the runtime directory (required by CI runtime assembly)', () => {
     const fs2 = require('fs');
     const os2 = require('os');
     const tmp = fs2.mkdtempSync(path.join(os2.tmpdir(), 'sysroot-'));
@@ -1508,98 +1508,98 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       store.saveSettings({ runtime: { dir: root } });
       const p = new Provisioner(path.join(__dirname, '..'));
 
-      // 1) 全新安装：运行时目录与用户数据目录都没有 system-images → 落运行时目录
+      // 1) New installation: neither runtime nor user data contains system-images; use the runtime directory.
       assert(p.paths().sysImgRoot === path.join(root, 'system-images'),
-        `全新安装应落运行时目录，实际 ${p.paths().sysImgRoot}`);
+        `Expected a new installation in the runtime directory; got ${p.paths().sysImgRoot}`);
 
-      // 2) 运行时目录里已经有（整包解压的产物）→ 优先它
+      // 2) If the runtime directory already contains the image (for example, from the full package), prefer it.
       fs2.mkdirSync(path.join(root, 'system-images'), { recursive: true });
-      assert(p.paths().sysImgRoot === path.join(root, 'system-images'), '已有应优先运行时目录');
+      assert(p.paths().sysImgRoot === path.join(root, 'system-images'), 'Prefer the existing image in the runtime directory');
 
-      // 3) 只有用户数据目录有（老版本布局）→ 用它
+      // 3) If only the user data directory has the image (legacy layout), use it.
       fs2.rmSync(path.join(root, 'system-images'), { recursive: true, force: true });
       fs2.mkdirSync(path.join(store.DATA_DIR, 'system-images'), { recursive: true });
       assert(p.paths().sysImgRoot === path.join(store.DATA_DIR, 'system-images'),
-        `老布局应回退到用户数据目录，实际 ${p.paths().sysImgRoot}`);
+        `Expected legacy layout to fall back to the user data directory; got ${p.paths().sysImgRoot}`);
     } finally {
       if (oldAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = oldAppData;
       fs2.rmSync(tmp, { recursive: true, force: true });
     }
   });
 
-  console.log('\n[资源策略 / 磁盘分配 / 日志上限]');
+  console.log('\n[resource profiles, disk allocation, and log limits]');
 
-  await test('资源策略一处切换，自动翻译成 vCPU/优先级/分辨率', () => {
+  await test('A single resource-profile selection controls vCPU, priority, and resolution', () => {
     const store = require('../src/core/store');
     let s = store.saveSettings({ engine: { resourceMode: 'smooth' } });
-    assert(s.engine.liteMode === false, '流畅模式不应限制核数');
-    assert(s.engine.priorityMode === 'game', '流畅模式应进低延迟游戏优先级（FPS/视频优先）');
-    assert(s.engine.renderSize === '720x1280', `分辨率应 720p，实际 ${s.engine.renderSize}`);
+    assert(s.engine.liteMode === false, 'Smooth mode should not limit the core count');
+    assert(s.engine.priorityMode === 'game', 'Smooth mode should use low-latency game priority (favor FPS and video)');
+    assert(s.engine.renderSize === '720x1280', `Expected 720p resolution; got ${s.engine.renderSize}`);
     s = store.saveSettings({ engine: { resourceMode: 'save' } });
-    assert(s.engine.liteMode === true && s.engine.renderSize === '540x960', '省资源应 540p + 轻量容器');
+    assert(s.engine.liteMode === true && s.engine.renderSize === '540x960', 'Resource-saving mode should use 540p and a lightweight container');
     s = store.saveSettings({ engine: { resourceMode: 'balanced' } });
-    assert(s.engine.renderSize === 'auto', '均衡模式分辨率交给自动');
+    assert(s.engine.renderSize === 'auto', 'Balanced mode should use automatic resolution');
   });
 
-  await test('数据分区容量可配置，且默认不再是死数字', () => {
+  await test('Data-partition size is configurable and no longer a fixed default', () => {
     const store = require('../src/core/store');
     store.saveSettings({ engine: { dataPartitionGB: 12 } });
     const p = doctor.autoProfile({ settings: store.getSettings(), accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 50000 });
-    assert(p.dataMB === 12 * 1024, `应为 12GB，实际 ${p.dataMB}MB`);
+    assert(p.dataMB === 12 * 1024, `Expected 12 GB; got ${p.dataMB} MB`);
     store.saveSettings({ engine: { dataPartitionGB: 0 } });
     const auto = doctor.autoProfile({ settings: store.getSettings(), accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 50000 });
-    assert(auto.dataMB === 6144, `磁盘充裕时自动应 6GB，实际 ${auto.dataMB}`);
+    assert(auto.dataMB === 6144, `Expected 6 GB automatically when disk space is sufficient; got ${auto.dataMB} MB`);
   });
 
-  await test('快照指纹不含数据分区大小（扩容不该作废快照、更不该清数据）', () => {
+  await test('Snapshot fingerprint excludes data-partition size (resizing must not invalidate snapshots or clear data)', () => {
     const base = { emulatorVersion: '37.3.8', api: '34', tag: 'google_apis_playstore' };
     const a = doctor.snapshotKey({ ...base, dataMB: 4096 }, 'img');
     const b = doctor.snapshotKey({ ...base, dataMB: 24576 }, 'img');
-    assert(a === b, '只改容量不应改变指纹');
+    assert(a === b, 'Changing only the size must not change the fingerprint');
     const c = doctor.snapshotKey({ ...base, dataMB: 4096, emulatorVersion: '36.0.0' }, 'img');
-    assert(a !== c, '换引擎版本应改变指纹');
+    assert(a !== c, 'Changing emulator version must change the fingerprint');
   });
 
-  await test('日志超过上限自动滚动，只保留一份备份', () => {
+  await test('Rotate logs over the size limit and keep only one backup', () => {
     const lf = require('../src/core/logfile');
     const f = path.join(TMP, 'rot.log');
     fs.writeFileSync(f, 'x'.repeat(300 * 1024));
     const rotated = lf.rotate(f, 256);
-    assert(rotated === true, '应执行滚动');
-    assert(!fs.existsSync(f) && fs.existsSync(path.join(TMP, 'rot.1.log')), '应变成 .1.log');
+    assert(rotated === true, 'Expected the log to rotate');
+    assert(!fs.existsSync(f) && fs.existsSync(path.join(TMP, 'rot.1.log')), 'Expected the backup to be named .1.log');
   });
 
-  await test('日志文件名不以 .log 结尾时：宁可滚不动，也不能把日志删掉', () => {
+  await test('If a log filename does not end in .log, do not delete it just to rotate', () => {
     const lf = require('../src/core/logfile');
     const f = path.join(TMP, 'plain.txt');
     fs.writeFileSync(f, 'x'.repeat(300 * 1024));
     const rotated = lf.rotate(f, 256);
-    assert(rotated === false, 'bak 与源文件同名时必须放弃滚动');
-    assert(fs.existsSync(f), '日志文件不能被删掉');
+    assert(rotated === false, 'Abort rotation if the backup path would equal the source path');
+    assert(fs.existsSync(f), 'The log file must not be deleted');
   });
 
-  await test('启动失败记录会落盘，重启后再导出诊断报告也能看到真实原因', () => {
+  await test('Persist startup failures so diagnostic reports show the actual cause after restart', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     emu.lastExitCode = 3221225477;
     emu.lastDiagnosis = doctor.diagnose(['emulator exit 3221225477']);
-    emu.attempts = [{ plan: 'host / 硬件加速', diagnosis: 'ACCESS_VIOLATION', exitCode: 3221225477 }];
+    emu.attempts = [{ plan: 'host / hardware acceleration', diagnosis: 'ACCESS_VIOLATION', exitCode: 3221225477 }];
     emu._persistFailure({ why: 'test' });
     const back = emu.lastFailure();
-    assert(back && back.exitCode === 3221225477, '退出码应落盘');
-    assert(back.diagnosis && back.diagnosis.code === 'ACCESS_VIOLATION', '诊断结论应落盘');
-    assert(back.attempts.length === 1, '尝试记录应落盘');
+    assert(back && back.exitCode === 3221225477, 'Exit code should be persisted');
+    assert(back.diagnosis && back.diagnosis.code === 'ACCESS_VIOLATION', 'Diagnosis should be persisted');
+    assert(back.attempts.length === 1, 'Attempt history should be persisted');
     emu._clearFailure();
-    assert(emu.lastFailure() === null, '启动成功后应清掉失败记录');
+    assert(emu.lastFailure() === null, 'Clear the failure record after a successful launch');
   });
 
-  await test('.xapk 拆分包：流式解出分片、解析 base、失败时清理临时目录', async () => {
+  await test('.xapk split bundle: stream out parts, parse the base APK, and clean up on failure', async () => {
     const crypto = require('crypto');
     const { parseBundle } = require('../src/core/installer');
     const { buildApkBytes, buildStoredZip } = require('./lib/make-apk');
     const apk = buildApkBytes();
 
-    // 成功：包内两个分片（base + config），meta 来自可解析的那个
+    // Success case: two APK splits (base + config); metadata comes from the parseable split.
     const okPath = path.join(TMP, 'ok.xapk');
     fs.writeFileSync(okPath, buildStoredZip([
       { name: 'base.apk', data: apk },
@@ -1608,25 +1608,25 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     ]));
     const b = await parseBundle(okPath);
     try {
-      assert(b.files.length === 2, `应解出 2 个分片，实际 ${b.files.length}`);
-      assert(b.files.every((f) => fs.existsSync(f)), '分片应落盘');
-      assert(b.meta.package === 'com.example.test', `包名 ${b.meta.package}`);
+      assert(b.files.length === 2, `Expected two APK splits; got ${b.files.length}`);
+      assert(b.files.every((f) => fs.existsSync(f)), 'Split files should be written to disk');
+      assert(b.meta.package === 'com.example.test', `Package name: ${b.meta.package}`);
     } finally {
       b.cleanup();
     }
 
-    // 失败：包里没有 APK 分片 → 明确报错，且不能把临时目录留在用户机器上
+    // Failure case: no APK splits should produce a clear error and leave no temporary directory behind.
     const badPath = path.join(TMP, 'bad.xapk');
     fs.writeFileSync(badPath, buildStoredZip([{ name: 'readme.txt', data: Buffer.from('nope') }]));
     let err = null;
     try { await parseBundle(badPath); } catch (e) { err = e; }
-    assert(err && /没有找到 APK 分片/.test(err.message), `应报没有分片，实际 ${err && err.message}`);
+    assert(err && /No split APK entries found/i.test(err.message), `Expected a missing-splits error, got ${err && err.message}`);
     const dir = path.join(os.tmpdir(), 'apkstart-bundle',
       crypto.createHash('sha1').update(badPath).digest('hex').slice(0, 12));
-    assert(!fs.existsSync(dir), '失败时应清理临时目录');
+    assert(!fs.existsSync(dir), 'Remove the temporary directory on failure');
   });
 
-  await test('materializeImages：展开 .img.gz、已展开跳过、坏镜像上报失败且不留半截', async () => {
+  await test('materializeImages decompresses .img.gz, skips existing images, and cleans up invalid output', async () => {
     const zlib = require('zlib');
     const store = require('../src/core/store');
     const { Provisioner } = require('../src/core/provision');
@@ -1635,79 +1635,79 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const imgDir = path.join(rt, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
     fs.mkdirSync(imgDir, { recursive: true });
     fs.writeFileSync(path.join(imgDir, 'kernel-ranchu'), 'kernel');
-    // 40MB 全零：gzip 后只有几十 KB，但解压后 >32MB，正好能验证「已展开」的判定
+    // 40 MB of zeros compresses to a few dozen KB but expands past 32 MB, testing the expanded-image check.
     fs.writeFileSync(path.join(imgDir, 'system.img.gz'), zlib.gzipSync(Buffer.alloc(40 * 1024 * 1024, 7)));
     store.saveSettings({ runtime: { dir: rt } });
     const prov = new Provisioner(path.join(__dirname, '..'));
     try {
       const n = await prov.materializeImages();
-      assert(n === 1, `应展开 1 个镜像，实际 ${n}`);
+      assert(n === 1, `Expected one image to be materialized; got ${n}`);
       const img = path.join(imgDir, 'system.img');
-      assert(fs.statSync(img).size === 40 * 1024 * 1024, '展开大小应正确');
-      assert(fs.existsSync(path.join(imgDir, 'kernel-ranchu')), '非压缩组件应一并就位');
-      assert(!fs.existsSync(`${img}.part`), '成功时不应留下 .part');
+      assert(fs.statSync(img).size === 40 * 1024 * 1024, 'Expanded image has the expected size');
+      assert(fs.existsSync(path.join(imgDir, 'kernel-ranchu')), 'Uncompressed components should remain in place');
+      assert(!fs.existsSync(`${img}.part`), 'Do not leave a .part file on success');
 
       const again = await prov.materializeImages();
-      assert(again === 0, `已展开时应跳过，实际展开了 ${again}`);
+      assert(again === 0, `Expected an existing image to be skipped; materialized ${again}`);
 
-      // 坏镜像：必须抛 MATERIALIZE_FAILED，并且清掉 .part（否则下次会被当成已完成）
+      // Invalid image must throw MATERIALIZE_FAILED and remove .part (otherwise the next run may treat it as complete).
       fs.rmSync(img, { force: true });
       fs.writeFileSync(path.join(imgDir, 'system.img.gz'), Buffer.from('not a gzip at all'));
       let err = null;
       try { await prov.materializeImages(); } catch (e) { err = e; }
-      assert(err && err.code === 'MATERIALIZE_FAILED', `坏镜像应失败，实际 ${err && err.message}`);
-      assert(!fs.existsSync(`${img}.part`), '失败后不应留下 .part');
+      assert(err && err.code === 'MATERIALIZE_FAILED', `Expected invalid image to fail; got ${err && err.message}`);
+      assert(!fs.existsSync(`${img}.part`), 'Do not leave a .part file on failure');
     } finally {
       store.saveSettings({ runtime: { dir: before } });
     }
   });
 
-  await test('换下载源/整包地址后：provisioner 的地址缓存必须被清掉（否则要重启才生效）', () => {
+  await test('Changing download sources or bundle URLs must clear provisioner URL caches (otherwise a restart is required)', () => {
     const { Provisioner } = require('../src/core/provision');
     const p = new Provisioner(path.join(__dirname, '..'));
-    // 模拟解析过一次整包地址 / 引擎地址后的缓存
+    // Simulate cached bundle and emulator URLs.
     p._cache.pack = { url: 'https://old.example/runtime.zip', tag: 'v1' };
     p._cache.emulatorUrl = 'https://old.example/emulator.zip';
     p._cache.sysimgUrl = 'https://old.example/sysimg.zip';
     p.invalidateEnvCache();
-    assert(!p._cache.pack, '整包地址缓存应被清空');
-    assert(!p._cache.emulatorUrl && !p._cache.sysimgUrl, '引擎/镜像地址缓存应被清空');
+    assert(!p._cache.pack, 'Bundle URL cache should be cleared');
+    assert(!p._cache.emulatorUrl && !p._cache.sysimgUrl, 'Emulator and system-image URL caches should be cleared');
   });
 
-  await test('每轮启动只用本轮日志做诊断（上一轮的崩溃不能污染下一轮）', () => {
+  await test('Diagnose each startup attempt using only its own logs (a previous crash must not affect the next attempt)', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     emu._log = [
       { t: 1, line: 'Graphics backend: gfxstream' },
-      { t: 2, line: 'emulator exit 3221225477' },        // 第 1 轮：0xC0000005
-      { t: 3, line: '--- 第 2 轮 ---' },
-      { t: 4, line: 'Address already in use' },          // 第 2 轮：端口被占
+      { t: 2, line: 'emulator exit 3221225477' },        // Round 1: 0xC0000005
+      { t: 3, line: '--- Round 2 ---' },
+      { t: 4, line: 'Address already in use' },          // Round 2: port already in use
     ];
-    assert(doctor.diagnose(emu._attemptLines(0, 80)).code === 'ACCESS_VIOLATION', '第 1 轮应判崩溃');
-    assert(doctor.diagnose(emu._attemptLines(2, 80)).code === 'PORT_BUSY', '第 2 轮应判端口占用');
-    // 本轮没有任何日志时退回整体尾部，不能直接 UNKNOWN
+    assert(doctor.diagnose(emu._attemptLines(0, 80)).code === 'ACCESS_VIOLATION', 'Round 1 should be diagnosed as a crash');
+    assert(doctor.diagnose(emu._attemptLines(2, 80)).code === 'PORT_BUSY', 'Round 2 should be diagnosed as a port conflict');
+    // If the current attempt has no logs, fall back to the overall log tail instead of returning UNKNOWN.
     const fallback = emu._attemptLines(emu._log.length, 80);
-    assert(fallback.length === emu._log.length, `空轮次应退回整体日志，实际 ${fallback.length} 行`);
+    assert(fallback.length === emu._log.length, `An empty attempt should fall back to the full log; got ${fallback.length} lines`);
   });
 
-  await test('启动组件拼接：完整组件不能重复拼包名（否则点图标只看到安卓桌面）', () => {
+  await test('Launch component parsing must not duplicate the package name (otherwise the app icon opens only the Android home screen)', () => {
     const { componentArg, parseResolvedActivity } = require('../src/core/adb');
-    // 完整组件（v0.3.4 装完后 apps.json 里存的就是这种）→ 原样使用
+    // Full components (stored in apps.json after v0.3.4) should be used as-is.
     assert(componentArg('com.phoenix.read', 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity')
-      === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', '完整组件应原样返回');
-    // 老数据：纯类名 / 以点开头的类名 → 补包名
+      === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', 'Full component should be returned unchanged');
+    // Legacy data: prepend the package name to bare or dot-prefixed class names.
     assert(componentArg('com.a.b', 'MainActivity') === 'com.a.b/MainActivity');
     assert(componentArg('com.a.b', '.MainActivity') === 'com.a.b/.MainActivity');
-    assert(componentArg('com.a.b', '') === '', '空 activity 应返回空（走隐式 intent）');
-    // resolve-activity 输出末尾常有空行/priority 行：必须能取到组件
+    assert(componentArg('com.a.b', '') === '', 'An empty activity should return an empty string (use the implicit intent)');
+    // resolve-activity output often ends with blank or priority lines; still find the component.
     const out = 'priority=0\ncom.phoenix.read/com.dragon.read.pages.splash.SplashActivity\n\n';
     assert(parseResolvedActivity('com.phoenix.read', out)
-      === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', '应跳过空行取到最后一行组件');
-    assert(parseResolvedActivity('com.other', out) === '', '别的包名不能拿来用');
+      === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', 'Skip blank lines and retrieve the final component line');
+    assert(parseResolvedActivity('com.other', out) === '', 'Do not use a component for another package');
   });
 
   console.log(results.join('\n'));
-  console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
+  console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }
   process.exit(failed ? 1 : 0);
 })();

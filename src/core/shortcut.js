@@ -1,9 +1,11 @@
 'use strict';
 /**
- * 桌面快捷方式 + 多尺寸 ICO 生成
+ * Windows `.lnk` Desktop / Start Menu shortcut writer & multi-resolution ICO encoder (`shortcut.js`).
  *
- * ICO 直接用 Electron nativeImage 缩放并手写 ICO 容器（DIB 格式，全 Windows 版本兼容），
- * 不依赖任何第三方图像库，也不需要 ImageMagick。
+ * Uses a 3-tier icon pipeline so every shortcut gets a crisp icon without external native deps:
+ *  1) Electron `nativeImage` (PNG/JPEG) -> multi-size DIB ICO (16..256 px);
+ *  2) Hidden Chromium renderer `decode` callback (WebP) -> PNG-in-ICO;
+ *  3) Procedural `drawAppIcon(256)` brand icon -> PNG-in-ICO.
  */
 const fs = require('fs');
 const path = require('path');
@@ -12,30 +14,24 @@ const ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256];
 
 function buildDib(bgra, size) {
   const header = Buffer.alloc(40);
-  header.writeUInt32LE(40, 0);           // biSize
-  header.writeInt32LE(size, 4);          // biWidth
-  header.writeInt32LE(size * 2, 8);      // biHeight = XOR + AND
-  header.writeUInt16LE(1, 12);           // biPlanes
-  header.writeUInt16LE(32, 14);          // biBitCount
-  header.writeUInt32LE(0, 16);           // BI_RGB
+  header.writeUInt32LE(40, 0);
+  header.writeInt32LE(size, 4);
+  header.writeInt32LE(size * 2, 8);
+  header.writeUInt16LE(1, 12);
+  header.writeUInt16LE(32, 14);
+  header.writeUInt32LE(0, 16);
   header.writeUInt32LE(size * size * 4, 20);
 
-  // XOR 位图：自下而上，行内 BGRA
   const xor = Buffer.alloc(size * size * 4);
   for (let y = 0; y < size; y++) {
     const srcRow = (size - 1 - y) * size * 4;
     bgra.copy(xor, y * size * 4, srcRow, srcRow + size * 4);
   }
-  // AND 掩码：1bpp，行按 4 字节对齐，全 0（交给 alpha 通道）
   const maskRow = Math.ceil(size / 32) * 4;
   const mask = Buffer.alloc(maskRow * size, 0);
   return Buffer.concat([header, xor, mask]);
 }
 
-/**
- * @param {Buffer} pngBuffer 任意尺寸的 PNG
- * @returns {Buffer|null} ICO 文件内容
- */
 function pngToIco(pngBuffer) {
   const { nativeImage } = require('electron');
   const base = nativeImage.createFromBuffer(pngBuffer);
@@ -43,9 +39,7 @@ function pngToIco(pngBuffer) {
 
   const images = [];
   for (const s of ICO_SIZES) {
-    const img = base.getSize().width >= s
-      ? base.resize({ width: s, height: s, quality: 'best' })
-      : base.resize({ width: s, height: s, quality: 'best' }); // 小图放大也比缺尺寸好
+    const img = base.resize({ width: s, height: s, quality: 'best' });
     const dib = buildDib(img.toBitmap(), s);
     images.push({ size: s, data: dib });
   }
@@ -76,10 +70,6 @@ function safeFileName(name) {
   return String(name).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Android App';
 }
 
-/**
- * PNG-in-ICO：Vista 起 ICO 条目允许直接内嵌 PNG，不用重编码、不丢 alpha。
- * APK 图标常是 WebP/大尺寸 PNG，老的 DIB 路线在这里会整包失败。
- */
 function pngBytesToIco(png) {
   if (!Buffer.isBuffer(png) || png.length < 24 || png.toString('ascii', 1, 4) !== 'PNG') return null;
   const w = png.readUInt32BE(16);
@@ -100,12 +90,6 @@ function pngBytesToIco(png) {
   return Buffer.concat([dir, png]);
 }
 
-/**
- * 任意 APK 图标 → ICO。三级兜底，保证快捷方式永远带图标：
- *  1) Electron 能直接解（真 PNG/JPEG）→ 多尺寸 DIB ICO；
- *  2) decode 回调（渲染进程用 Chromium 解 WebP）→ PNG-in-ICO；
- *  3) 品牌占位图标 → PNG-in-ICO。
- */
 async function iconToIco(raw, { decode, onFallback } = {}) {
   const fail = (why) => { try { if (onFallback) onFallback(why); } catch (_) { /* ignore */ } };
   if (!Buffer.isBuffer(raw) || !raw.length) { fail('empty'); return null; }
@@ -116,7 +100,7 @@ async function iconToIco(raw, { decode, onFallback } = {}) {
       const ico = pngToIco(img.toPNG());
       if (ico) return ico;
     }
-  } catch (_) { /* 非 PNG/JPEG，走下一级 */ }
+  } catch (_) { /* Not PNG/JPEG; try WebP decoder next */ }
 
   if (typeof decode === 'function') {
     try {
@@ -136,22 +120,13 @@ async function iconToIco(raw, { decode, onFallback } = {}) {
   return null;
 }
 
-/**
- * 生成桌面快捷方式
- *
- * writeShortcutLink 返回 true 并不代表文件真的落盘了：安全软件拦截、
- * 桌面目录被重定向到未登录的网盘时都可能「成功但没文件」。所以写完必须
- * 回读一次，保证调用方拿到的路径是真实存在的入口。
- *
- * @param {object} opt { shortcutPath, target, args, iconIcoPath, description, cwd }
- */
 function writeShortcut(opt) {
   const { shell } = require('electron');
   const dir = path.dirname(opt.shortcutPath);
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   } catch (e) {
-    throw new Error(`快捷方式目录不可写：${dir}（${e.message}）`);
+    throw new Error(`Shortcut directory is not writable: ${dir} (${e.message})`);
   }
   if (fs.existsSync(opt.shortcutPath)) {
     try { fs.unlinkSync(opt.shortcutPath); } catch (_) { /* ignore */ }
@@ -165,9 +140,9 @@ function writeShortcut(opt) {
     cwd: opt.cwd || path.dirname(opt.target),
     appUserModelId: opt.appUserModelId,
   });
-  if (!ok) throw new Error('创建快捷方式失败（writeShortcutLink 返回 false）');
+  if (!ok) throw new Error('Failed to create shortcut (writeShortcutLink returned false)');
   if (!fs.existsSync(opt.shortcutPath)) {
-    throw new Error(`快捷方式未落盘：${opt.shortcutPath}`);
+    throw new Error(`Shortcut was not written to disk: ${opt.shortcutPath}`);
   }
   return opt.shortcutPath;
 }

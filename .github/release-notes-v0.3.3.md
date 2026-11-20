@@ -1,60 +1,48 @@
-## 这一版解决什么
+## What changed
 
-### 1. 下载慢：真正的原因是「所有线程都挤在一个被墙的地址上」
+### 1. Faster downloads through multi-source requests
 
-实测这台机器：8 线程全打 GitHub 只有 **0.23 MB/s**，113MB 的更新包要 **493 秒**；
-同一时间两条连接打直连是**零字节**（TCP 通但没有数据），只有镜像在跑。
+Measurements on the test machine showed that eight GitHub-only connections achieved just **0.23 MB/s**, taking **493 seconds** to download a 113 MB update. Direct connections transferred no data even though TCP connected; only mirrors worked.
 
-- **多源并行分片**：文件切块后，不同块同时从「GitHub 直连 / ghfast / gh-proxy」拉，带宽叠加。
-  同一台机器实测：**113MB 从 493 秒降到 77 秒**（约 1.5 MB/s，含测速与解压）。
-- **低速换源**：某个分块跑到几十 KB/s 时自动中断、换源、从断点继续 —— 以前会「卡在 95% 不动」。
-- **分块断点续传**：1.4GB 的运行时包下到一半失败，重新执行只补缺的块，不用从头再来。
-- **停滞看门狗**：连接建立了但 20 秒不给字节，立刻丢弃这条连接换下一个源，
-  不再傻等 30 秒 socket 超时把整包卡死。
-- **每次现测现选**：每个候选地址真下 256KB 测速，只算「收到首字节之后」的吞吐
-  （握手几百毫秒算进去会把「延迟高但带宽大」的源误判成慢）；顺序测避免互相抢带宽。
+- **Parallel chunks from multiple sources:** download different chunks concurrently from GitHub direct, ghfast, and gh-proxy, combining available bandwidth. On the same machine, 113 MB dropped from **493 to 77 seconds** (about 1.5 MB/s, including source ranking and extraction).
+- **Switch away from slow sources:** interrupt a chunk that falls to tens of KB/s, resume it from another source, and avoid stalling near 95%.
+- **Resumable chunk downloads:** retrying a failed 1.4 GB runtime download fetches only missing chunks.
+- **Stall watchdog:** abandon a connection that has not delivered data for 20 seconds instead of waiting through a 30-second socket timeout.
+- **Measure sources before choosing:** download 256 KB from each candidate and compare throughput after the first byte arrives. Measure sequentially to avoid candidates competing for bandwidth.
 
-### 2. 双源：GitHub 与 Gitee 自动选优
+### 2. GitHub and Gitee source selection
 
-- 两个仓库现在都是公开的：GitHub `RoutineMiku/apkstart`、Gitee `daily-miku/apkstart`。
-- 版本检查同时问两边，取版本号更高的；一个源超时/被墙不影响另一个。
-- Gitee 发行版附件单文件上限 100MB，所以便携包在那里以 `.part1/.part2` 发布，
-  客户端自动逐片选源下载再拼回整包（校验各片大小，缺片即中止）。
-- Gitee 匿名调用有限流：加了 10 分钟版本缓存 + 403/429 熔断 15 分钟，
-  两个源全挂时退回上一次结果并标记 `stale`，界面不会直接报错。
+- Both repositories are public: GitHub `RoutineMiku/apkstart` and Gitee `daily-miku/apkstart`.
+- Check both for releases and use the higher version; one unavailable source does not block the other.
+- Gitee limits each release attachment to 100 MB, so portable packages are published as `.part1`/`.part2` files when needed. The client downloads parts (with size checks) and joins them; a missing part aborts the update.
+- Gitee rate limiting is handled with a 10-minute release cache and a 15-minute circuit breaker for 403/429 responses. If both sources are unavailable, return the last result marked `stale` instead of failing the UI.
 
-### 3. 不会再误删用户数据
+### 3. Protect user data
 
-- **磁盘写满时不再自动清数据**：以前重试矩阵最后一档带 `-wipe-data`，磁盘满时每档都失败，
-  连续重试会把应用和存档一起抹掉。现在任何自动重试都禁止清数据，磁盘不足直接停下并告诉你怎么办。
-- **镜像换盘不算换镜像**：把运行时目录从 C 盘挪到 D 盘（设置里就建议这么做）以后，
-  以前会被判定「镜像变了」→ `-wipe-data` → 已装应用全丢。现在按镜像身份比较，换盘不动数据。
-- **`qemu-img resize` 参数顺序**修正：以前会出现「文件撑到 6GB、文件系统还是 64MB」，
-  安卓一写就满，所有服务 `setxattr` 报 ENOSPC 崩掉。现在启动时还会自愈比对。
+- **Do not wipe data when disk space is low:** the old retry matrix ended with `-wipe-data`. When every retry failed because the disk was full, this could erase installed apps and saves. Automatic retries no longer wipe data; low disk space stops with guidance.
+- **Moving a runtime directory is not changing the image:** moving the runtime from C: to D: previously changed the path-based identity, triggered `-wipe-data`, and removed installed apps. Image identity is now independent of its directory path.
+- **Fix `qemu-img resize` argument order:** the old order could enlarge the file to 6 GB while leaving the filesystem at 64 MB, causing `ENOSPC` failures. Startup now also checks and repairs the mismatch.
 
-### 4. 其他
+### 4. Other changes
 
-- 安装失败不再刷屏：同一个 APK 连点只跑一次；失败提示按类型给出可执行结论
-  （分区不够 / ARM 包 / 签名冲突 / 版本降级）。
-- 资源与磁盘可控：资源策略三档（省资源 / 均衡 / 流畅）、画质三档、
-  安卓数据分区 4–24GB 可调并支持就地扩容（不丢已装应用）、安卓数据目录可单独指到别的盘。
-- 体积：便携版 230MB（裁掉 52 个用不到的语言包，省 39MB）。
-- 日志按大小滚动，不再无限增长；共享目录同步不再把同一个文件反复搬来搬去。
+- Failed APK installs no longer spam duplicate attempts; errors explain actionable causes such as insufficient partition space, ARM-only packages, signature conflicts, or downgrades.
+- Resource controls include three performance profiles, three graphics-quality levels, and a configurable 4–24 GB Android data partition that can be expanded in place without losing installed apps. The Android data directory can be moved to another drive.
+- Portable package size: 230 MB after removing 52 unused language packs (39 MB saved).
+- Logs rotate by size, and shared-folder sync no longer repeatedly copies the same file.
 
-## 本次实机验证（同一台机器，Windows 11 + Android 14 Play 镜像）
+## Reported validation (Windows 11, Android 14 Play image)
 
-| 项目 | 结果 |
+| Check | Result |
 |---|---|
-| 冷启动到可打开应用 | **23–25 秒**（首次含探测约 32 秒） |
-| 命中 quickboot 快照 | **5 秒** |
-| 安装 APK 并打开应用 | 应用窗口 **1.5 秒**出现（热快照） |
-| 开机 45 秒全程可见的模拟器/控制台窗口 | **0 个** |
-| 退出 ApkStart 后桌面上残留的窗口 | **0 个** |
+| Cold boot to app-ready | **23–25 seconds** (about 32 seconds on the first run, including detection) |
+| Quickboot snapshot restore | **5 seconds** |
+| Install and launch APK | App window appeared in **1.5 seconds** from a warm snapshot |
+| Visible emulator/console windows during a 45-second boot | **0** |
+| Windows left behind after ApkStart exits | **0** |
 
-## 安装
+## Packages
 
-- **完整版** `ApkStart-*-Setup.exe`：自带运行时，装完即用（约 1.4GB）。
-- **轻量版** `ApkStart-*-win64-portable.zip`：解压即用，首次启动自动下载运行时
-  （现在会挑最快的源，且断点续传）。
+- **Full setup:** `ApkStart-*-Setup.exe`, includes the runtime and works immediately after installation (about 1.4 GB).
+- **Portable:** `ApkStart-*-win64-portable.zip`, extract and run; the runtime downloads on first launch with source selection and resume support.
 
-两个仓库内容一致，国内建议走 Gitee。
+The GitHub and Gitee releases contain the same portable package; Gitee may be preferable on some networks.

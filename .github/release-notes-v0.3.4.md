@@ -1,78 +1,64 @@
-## 这一版解决什么
+## What changed
 
-### 1. 打开 ApkStart 会把微信（以及其它 Qt 应用）的窗口弄没
+### 1. Prevent ApkStart from hiding other Qt applications
 
-这是上一版最严重的问题。窗口代理原来靠**窗口类名**认自己的窗口：
+The window agent previously identified its own windows by class name:
 
-- `FindEmulator()` 认「类名含 `QWindowIcon`」的窗口 —— 这是**所有 Qt 顶层窗口**的类名；
-- `HideToolWindows()` 认「类名含 `QWindowTool`」的窗口 —— 而 Qt 的菜单、表情面板、
-  悬浮小窗用的正是 `QWindowToolSaveBits`；
-- 常驻压制每 120ms 扫一轮，扫到就 `ShowWindow(h, 0)`；`embed` / `park` 还会对它 `SetParent`。
+- `FindEmulator()` matched class names containing `QWindowIcon`, which is used by all Qt top-level windows.
+- `HideToolWindows()` matched `QWindowTool`, also used by Qt menus, emoji panels, and floating windows such as `QWindowToolSaveBits`.
+- A persistent scan ran every 120 ms, hid matches with `ShowWindow(h, 0)`, and could re-parent them during `embed` or `park`.
 
-微信 4.x 恰好就是 Qt 6（`Weixin.dll` 里有 `QWindowToolSaveBits` / `Qt6` 字符串），
-主窗口类名是 `Qt51514QWindowIcon` —— 和模拟器一模一样。于是「打开 ApkStart，
-微信窗口消失/被嵌进 ApkStart 变成黑块」就发生了。
+WeChat 4.x uses Qt 6 and has a main-window class like `Qt51514QWindowIcon`. Opening ApkStart could therefore hide or embed a WeChat window, leaving a black area.
 
-**同一台机器上的实测对比**（微信 4.1.7.59，主窗 296×388）：
+**Fix: class name is not identity; process path is.**
 
-| 版本 | 微信窗口状态 |
+- Add a `scope` command. Before hiding or embedding windows, the main process supplies the runtime directories and its process ID.
+- Every window must pass `IsOurs(pid)`: its executable path must be inside one of the declared directories.
+- With no scope, the agent leaves every window alone. Missing an unwanted window is safer than hiding another app.
+- Console windows are identified through the conhost parent-process chain or an absolute runtime path in the title, not vague `emulator`/`qemu`/`netsim` title matching.
+- `embed` verifies that the host window belongs to the main process, protecting against a recycled window handle.
+- The mouse hook checks that its host still exists and belongs to the expected process; stale handles are allowed through.
+- Rotation shortcuts are sent only when an ApkStart window is foreground.
+- A restarted agent receives the scope again.
+
+**Reported comparison on one machine** (WeChat 4.1.7.59, 296×388 main window):
+
+| Version | WeChat window |
 |---|---|
-| 0.3.3 | 启动 3.7 秒后 `hidden`，之后 74 次采样全部隐藏 |
-| 0.3.4 | 45 秒 / 280 秒两轮全程 `visible`，隐藏 0 次 |
+| 0.3.3 | Hidden 3.7 seconds after launch; hidden for all 74 subsequent samples |
+| 0.3.4 | Visible throughout 45-second and 280-second runs; never hidden |
 
-**修法：类名不是身份，进程路径才是。**
+### 2. Publish one directly extractable portable ZIP on Gitee
 
-- 新增 `scope` 命令：主进程在压制/嵌入之前下发「我们的目录」（运行时根目录 + 随包的
-  `engine` 目录）和主进程 pid；
-- 所有窗口判定先过 `IsOurs(pid)`：进程可执行文件必须落在这些目录之内；
-- **没有 scope 时一个窗口都不动** —— 宁可漏一个黑窗，也绝不藏别人的窗口；
-- 控制台黑窗不再用「标题含 emulator/qemu/netsim」这种模糊匹配，改成 conhost 的父进程链
-  能走到运行时目录，或标题里出现运行时目录的绝对路径；
-- `embed` 校验宿主窗口的 pid 必须等于主进程 pid，否则拒绝（防止句柄回收后把窗口嵌进别人的应用）；
-- 鼠标钩子里加 `IsWindow(_host)` 与宿主 pid 校验，句柄失效就一律放行；
-- 旋转（Ctrl+←/→）只在自己窗口是前台时才发全局按键，否则干脆不发；
-- 代理进程重建后重新下发 scope，否则新代理什么都不敢碰。
+- Replace `Compress-Archive` (.NET Deflate) with 7-Zip `-mx=9`: the same directory shrank from **105.2 MB to 99.8 MB**.
+- Remove `d3dcompiler_47.dll` (Windows 8.1 and later provide it in System32; rendering was unchanged), saving another 2.1 MB. Keep `vk_swiftshader` and `vulkan-1` as GPU fallbacks.
+- The final archive was **95.0 MiB**, within Gitee's 100 MB single-file limit.
+- Add `build/zip.js` to validate entry count and expanded byte size with ApkStart's own ZIP reader. CI fails above 100 MiB instead of silently reverting to split archives.
 
-### 2. Gitee 上也放一个能直接双击解压的整包（不再是 part1/part2）
+### 3. Make automatic source selection actually keep both URLs
 
-- 换压缩器：`Compress-Archive`（.NET deflate）→ 7-Zip `-mx=9`，同一目录 **105.2MB → 99.8MB**；
-- 删掉包内的 `d3dcompiler_47.dll`（Windows 8.1 起 `System32` 自带同名 DLL，实测渲染无差异），
-  再省 2.1MB；`vk_swiftshader` / `vulkan-1` 保留 —— GPU 驱动不可用时靠它兜底；
-- 最终 **95.0 MiB**，在 Gitee 单文件上限（100MB）以内，下载下来直接解压即可；
-- 新增 `build/zip.js`：压完用应用自己的 zip 解析器核对条目数与解压总字节，
-  **超过 100MiB 直接让 CI 失败** —— 以后包变胖会当场炸，而不是又悄悄退回分片包。
+Assets with the same name were deduplicated by name, keeping whichever source appeared first. Because GitHub came first, the Gitee URL was discarded; after portable releases stopped using split parts, Gitee could never be selected.
 
-### 3. 「双源自动选优」之前其实没生效
+- Merge matching asset names into `urls` and store each source's `size` separately.
+- Rank sources before download. For multi-source chunks, use the fastest source's total size as the baseline instead of always choosing the largest archive.
+- On the test machine, Gitee was fastest among GitHub direct, ghfast, gh-proxy, and Gitee: **95.2 MB in 48 seconds** (about 2 MB/s).
 
-同名资产按名字去重、谁先来用谁，GitHub 排在前面，**Gitee 的同名地址被直接丢掉**。
-整包不再分片以后，等于永远只走 GitHub。
+### 4. Other changes
 
-- 同名资产改为合并 `urls`，并按地址分别记 `size`（两个源压出来的字节数本来就不同）；
-- 下载前测速择优；`downloadMulti` 的「只混用声明大小一致的源」改为以**最快那个源**的
-  总大小为基准（原来固定取 `Math.max`，等于总去下体积更大的那个源）；
-- 实测本机四个候选（GitHub 直连 / ghfast / gh-proxy / Gitee）里最快的是 Gitee，
-  95.2MB / 48 秒（约 2 MB/s）。
+- Window ownership checks now ignore emulators shipped with other products (such as MuMu or LDPlayer), avoiding unnecessary monitoring.
+- Window test tools (`check-agent`, `check-console`, `check-windows`, `check-launch-clean`, and `check-quit-clean`) now declare their scope.
 
-### 4. 其它
+## Validation reported for this release
 
-- 代理的「守窗」判定只认自己运行时里的进程，别的模拟器（MuMu / 雷电自带的 emulator.exe）
-  不会再让代理多守 3 分钟；
-- 工具脚本（`check-agent` / `check-console` / `check-windows` / `check-launch-clean` /
-  `check-quit-clean`）同步补上 scope。
-
-## 验证记录
-
-| 项目 | 结果 |
+| Check | Result |
 |---|---|
-| 单元 + 集成测试 | run-tests 3 / auto-test **70 通过，0 失败** |
-| 端到端（真实运行时 + 真实 AVD + 红果 APK） | 安装 → 打开 → 嵌入全部通过；应用窗口 0.5 秒出现；泄漏窗口累计 **0** |
-| 微信（4.1.7.59）共存 | 模拟器启动 / 装应用 / 嵌入全过程，微信窗口 hidden **0** 次 |
-| Gitee 整包 | 95.18 MiB，`Expand-Archive` 5.2 秒解压，69 个文件 md5 与源目录一致 |
-| 从 Gitee 实下 | 95.2MB / 48 秒，zip 结构完整 |
+| Unit and integration tests | `run-tests` 3; `auto-test` **70 passed, 0 failed** |
+| End-to-end with a real runtime, AVD, and Hongguo APK | Install, launch, and embed passed; app window appeared in 0.5 seconds; **0** leaked windows |
+| WeChat 4.1.7.59 coexistence | WeChat window was never hidden during emulator start, app install, or embed |
+| Gitee portable ZIP | 95.18 MiB; `Expand-Archive` took 5.2 seconds; MD5 matched all 69 source files |
+| Download from Gitee | 95.2 MB in 48 seconds; ZIP structure verified |
 
-## 下载
+## Downloads
 
-- 轻量版 `ApkStart-v0.3.4-win64-portable.zip`（**95 MB**，解压即用，首次启动再下运行时）：
-  GitHub 与 Gitee 都是**一个完整 zip**，不需要再拼接分片。
-- 完整版 `ApkStart-0.3.4-Setup.exe`（约 1.35 GB，内置 adb / 模拟器 / 系统镜像，装完即离线可用）：
-  体积超过 Gitee 单文件上限，只放在 GitHub。
+- Portable `ApkStart-v0.3.4-win64-portable.zip` (**95 MB**): extract and run; the runtime downloads on first launch. GitHub and Gitee both host one complete ZIP.
+- Full installer `ApkStart-0.3.4-Setup.exe` (about 1.35 GB): includes adb, the emulator, and system image; available on GitHub because it exceeds Gitee's limit.

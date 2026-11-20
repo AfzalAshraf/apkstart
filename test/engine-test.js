@@ -1,7 +1,7 @@
 'use strict';
 /**
- * 引擎与自举链路测试（不依赖真实 QEMU / adb / Android）
- * 覆盖：下载器（含断点续传）、ZIP 解压、环境检查、QEMU 启动参数、monitor 协议
+ * Engine and bootstrap tests (no real QEMU / adb / Android required)
+ * Covers downloads (including resume), ZIP extraction, environment checks, QEMU arguments, and the monitor protocol.
  */
 const os = require('os');
 const fs = require('fs');
@@ -9,7 +9,7 @@ const path = require('path');
 const http = require('http');
 const net = require('net');
 
-// 隔离测试数据目录，避免污染真实用户配置
+// Isolate test data so it cannot affect real user settings.
 const TMP = path.join(os.tmpdir(), `apkstart-test-${Date.now()}`);
 process.env.APPDATA = TMP;
 fs.mkdirSync(path.join(TMP, 'apkstart'), { recursive: true });
@@ -25,13 +25,13 @@ function test(name, fn) {
     .catch((e) => { failed++; results.push(`  ✗ ${name}\n    ${e.message}`); });
 }
 
-function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); }
+function assert(cond, msg) { if (!cond) throw new Error(msg || 'Assertion failed'); }
 
 (async () => {
   console.log('\n[download.js]');
   const { download, downloadParallel, head, sha256File } = require('../src/core/download');
 
-  // 本地 HTTP 服务模拟下载源（含 Range 续传）
+  // A local HTTP server simulates a download source, including Range resume.
   const payload = Buffer.alloc(300 * 1024);
   for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
 
@@ -49,7 +49,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       res.writeHead(200, { 'Content-Length': payload.length });
       return res.end(payload);
     }
-    // 完整支持 start-end 的 Range（用于并行分块测试）
+    // Fully support start-end Range requests for parallel chunk tests.
     if (req.url === '/ranged.bin') {
       server.rangeHits = (server.rangeHits || 0) + 1;
       const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
@@ -66,7 +66,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       });
       return res.end(payload.subarray(start, end + 1));
     }
-    // 明确不支持 Range
+    // Explicitly reject Range requests.
     if (req.url === '/norange.bin') {
       res.writeHead(200, { 'Content-Length': payload.length, 'Accept-Ranges': 'none' });
       return res.end(payload);
@@ -80,42 +80,42 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
 
-  await test('完整下载 + 跟随重定向', async () => {
+  await test('Complete download and follow redirects', async () => {
     const dest = path.join(TMP, 'dl1.bin');
     await download(`http://127.0.0.1:${port}/redirect`, dest);
-    assert(fs.statSync(dest).size === payload.length, '大小不符');
+    assert(fs.statSync(dest).size === payload.length, 'Unexpected size');
   });
 
-  await test('断点续传（已有半截文件）', async () => {
+  await test('Resume a partial download', async () => {
     const dest = path.join(TMP, 'dl2.bin');
     fs.writeFileSync(dest, payload.subarray(0, 100000));
     let lastPercent = 0;
     await download(`http://127.0.0.1:${port}/big.bin`, dest, {
       onProgress: (p) => { lastPercent = p.percent; },
     });
-    assert(fs.statSync(dest).size === payload.length, `续传后大小 ${fs.statSync(dest).size}`);
-    assert(fs.readFileSync(dest).equals(payload), '续传内容不一致');
-    assert(lastPercent > 50, '未上报进度');
+    assert(fs.statSync(dest).size === payload.length, `Size after resume: ${fs.statSync(dest).size}`);
+    assert(fs.readFileSync(dest).equals(payload), 'Resumed content does not match');
+    assert(lastPercent > 50, 'Progress was not reported');
   });
 
-  await test('HEAD 探测 + SHA256', async () => {
+  await test('HEAD request and SHA-256', async () => {
     const h = await head(`http://127.0.0.1:${port}/big.bin`);
-    assert(h.size === payload.length, 'HEAD 大小不符');
+    assert(h.size === payload.length, 'HEAD Unexpected size');
     const sum = await sha256File(path.join(TMP, 'dl1.bin'));
-    assert(/^[0-9a-f]{64}$/.test(sum), 'sha256 格式异常');
+    assert(/^[0-9a-f]{64}$/.test(sum), 'Invalid SHA-256 format');
   });
 
-  await test('SHA256 校验失败会清理文件', async () => {
+  await test('A SHA-256 mismatch removes the downloaded file', async () => {
     const dest = path.join(TMP, 'dl3.bin');
     let threw = false;
     try {
       await download(`http://127.0.0.1:${port}/big.bin`, dest, { expectSha256: 'deadbeef'.repeat(8) });
     } catch (_) { threw = true; }
-    assert(threw, '应当抛错');
-    assert(!fs.existsSync(dest), '校验失败应删除文件');
+    assert(threw, 'Expected an error');
+    assert(!fs.existsSync(dest), 'A checksum failure should remove the file');
   });
 
-  await test('并行分块下载：多连接拼接内容一致', async () => {
+  await test('Parallel chunk download reconstructs the file correctly', async () => {
     const dest = path.join(TMP, 'dl4.bin');
     server.rangeHits = 0;
     let maxPercent = 0;
@@ -124,20 +124,20 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       minChunk: 32 * 1024,
       onProgress: (p) => { maxPercent = Math.max(maxPercent, p.percent); },
     });
-    assert(fs.readFileSync(dest).equals(payload), '分块拼接后内容不一致');
-    assert(r.parallel > 1, `未启用并行：${r.parallel}`);
-    assert(server.rangeHits >= r.parallel, `分块请求数偏少：${server.rangeHits}`);
-    assert(maxPercent > 0, '未上报进度');
+    assert(fs.readFileSync(dest).equals(payload), 'Reconstructed chunks do not match the source');
+    assert(r.parallel > 1, `Parallel download was not used: ${r.parallel}`);
+    assert(server.rangeHits >= r.parallel, `Too few chunk requests: ${server.rangeHits}`);
+    assert(maxPercent > 0, 'Progress was not reported');
   });
 
-  await test('源不支持 Range 时自动回退单流', async () => {
+  await test('Fall back to a single stream when the source does not support Range', async () => {
     const dest = path.join(TMP, 'dl5.bin');
     const r = await downloadParallel(`http://127.0.0.1:${port}/norange.bin`, dest, {
       connections: 8,
       minChunk: 32 * 1024,
     });
-    assert(fs.readFileSync(dest).equals(payload), '回退后内容不一致');
-    assert(!r.parallel, '不应走并行');
+    assert(fs.readFileSync(dest).equals(payload), 'Fallback download does not match the source');
+    assert(!r.parallel, 'Parallel mode should not be used');
   });
 
   server.close();
@@ -146,26 +146,26 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   const { Provisioner } = require('../src/core/provision');
   const store = require('../src/core/store');
 
-  await test('默认运行时目录位于数据目录下', async () => {
+  await test('Default runtime directory is under the data directory', async () => {
     const p = new Provisioner('C:/fake/app');
-    assert(p.paths().root.startsWith(store.DATA_DIR), `路径异常: ${p.paths().root}`);
-    assert(p.paths().qemuExe.endsWith('qemu-system-x86_64.exe'), 'qemu 路径异常');
-    assert(p.paths().adbExe.endsWith('adb.exe'), 'adb 路径异常');
+    assert(p.paths().root.startsWith(store.DATA_DIR), `Unexpected path:  ${p.paths().root}`);
+    assert(p.paths().qemuExe.endsWith('qemu-system-x86_64.exe'), 'Unexpected QEMU path');
+    assert(p.paths().adbExe.endsWith('adb.exe'), 'Unexpected adb path');
   });
 
-  await test('空环境检查：adb 未就绪，组件结构完整', async () => {
+  await test('Empty environment: adb is unavailable but the component structure is valid', async () => {
     const p = new Provisioner(path.join(TMP, 'nonexistent'));
     const env = await p.checkEnv();
-    assert(env.adb.ok === false, 'adb 不应就绪');
-    // QEMU 可能已被系统级安装（如 winget 到 Program Files），此时应当被发现
-    if (env.qemu.ok) assert(env.qemu.version, 'qemu 就绪时必须带版本号');
-    assert(env.ready === false, '不应就绪');
-    assert(typeof env.hypervisor.whpx === 'boolean', '缺少超管信息');
+    assert(env.adb.ok === false, 'adb should not be ready');
+    // QEMU may be installed system-wide (for example, by winget under Program Files) and should be detected.
+    if (env.qemu.ok) assert(env.qemu.version, 'A ready QEMU must report its version');
+    assert(env.ready === false, 'The environment should not be ready');
+    assert(typeof env.hypervisor.whpx === 'boolean', 'Hypervisor information is missing');
   });
 
-  await test('内置 ZIP 解压可用', async () => {
+  await test('Built-in ZIP extraction works', async () => {
     const { ZipArchive } = require('../src/core/zip');
-    // 构造一个 stored 模式的最小 zip
+    // Construct a minimal ZIP using stored entries.
     const name = Buffer.from('platform-tools/adb.exe');
     const data = Buffer.from('fake-adb-binary');
     const loc = Buffer.alloc(30);
@@ -190,58 +190,58 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     const out = path.join(TMP, 'unzip');
     const p = new Provisioner(TMP);
     await p.extractZip(zipPath, out);
-    assert(fs.readFileSync(path.join(out, 'platform-tools', 'adb.exe')).toString() === 'fake-adb-binary', '解压内容不符');
-    assert(new ZipArchive(fs.readFileSync(zipPath)).has('platform-tools/adb.exe'), 'zip 读取异常');
+    assert(fs.readFileSync(path.join(out, 'platform-tools', 'adb.exe')).toString() === 'fake-adb-binary', 'Extracted contents do not match');
+    assert(new ZipArchive(fs.readFileSync(zipPath)).has('platform-tools/adb.exe'), 'ZIP entry could not be read');
   });
 
-  await test('SDK 索引里的相对 url 会被补全成绝对地址', async () => {
+  await test('Resolve relative URLs in the SDK index to absolute URLs', async () => {
     const { absUrl, baseOf, SOURCES } = require('../src/core/provision');
-    // repository2-3.xml（emulator）相对仓库根
+    // emulator entries in repository2-3.xml are relative to the repository root.
     assert(absUrl('emulator-windows_x64-16847572.zip') === `${baseOf(SOURCES.sdkIndex)}emulator-windows_x64-16847572.zip`,
-      'emulator 相对路径未补全');
-    // sys-img 索引相对 sys-img/android/，不能错拼到仓库根
+      'Relative emulator URL was not resolved');
+    // System-image indexes are relative to sys-img/android/, not the repository root.
     const sysBase = baseOf(SOURCES.sysImgIndexes[0]);
-    assert(sysBase.endsWith('/sys-img/android/'), `sys-img 基准目录异常: ${sysBase}`);
+    assert(sysBase.endsWith('/sys-img/android/'), `Unexpected system-image base URL:  ${sysBase}`);
     assert(absUrl('x86_64-30_r11.zip', sysBase) === 'https://dl.google.com/android/repository/sys-img/android/x86_64-30_r11.zip',
-      'sys-img 相对路径补全错误');
-    // 绝对地址原样返回
-    assert(absUrl('https://example.com/a.zip') === 'https://example.com/a.zip', '绝对地址被改写');
+      'Incorrect system-image relative URL resolution');
+    // Absolute URLs should remain unchanged.
+    assert(absUrl('https://example.com/a.zip') === 'https://example.com/a.zip', 'Absolute URL was modified');
   });
 
-  await test('解析出的 emulator / 系统镜像地址都是可下载的绝对 URL', async () => {
+  await test('Resolved emulator and system-image URLs are absolute and downloadable', async () => {
     const p = new Provisioner(TMP);
     const emuUrl = await p.resolveEmulatorUrl();
     const imgUrl = await p.resolveSysimgUrl();
     for (const u of [emuUrl, imgUrl]) {
-      assert(/^https?:\/\//i.test(u), `不是绝对 URL: ${u}`);
-      assert(/\.zip$/i.test(u), `不是 zip 包: ${u}`);
+      assert(/^https?:\/\//i.test(u), `Not an absolute URL:  ${u}`);
+      assert(/\.zip$/i.test(u), `Not a ZIP URL:  ${u}`);
     }
-    assert(/windows_x64/i.test(emuUrl), `emulator 包平台不对: ${emuUrl}`);
+    assert(/windows_x64/i.test(emuUrl), `Unexpected emulator package platform:  ${emuUrl}`);
   });
 
-  await test('AVD 配置使用 64 位架构（x86_64 不能被截成 x86）', async () => {
+  await test('AVD configuration preserves the x86_64 architecture', async () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(TMP);
     const r = emu.ensureAvd({ memoryMB: 2048, cores: 2 });
     const cfg = fs.readFileSync(path.join(r.avdDir, 'config.ini'), 'utf8');
-    assert(/^hw\.cpu\.arch=x86_64$/m.test(cfg), `hw.cpu.arch 应为 x86_64，实际：${cfg.match(/^hw\.cpu\.arch=.*$/m)}`);
-    assert(/^abi\.type=x86_64$/m.test(cfg), 'abi.type 应为 x86_64');
-    assert(/^image\.sysdir\.1=\S*system-images\//m.test(cfg), 'image.sysdir.1 缺失');
+    assert(/^hw\.cpu\.arch=x86_64$/m.test(cfg), `Expected hw.cpu.arch=x86_64, got: ${cfg.match(/^hw\.cpu\.arch=.*$/m)}`);
+    assert(/^abi\.type=x86_64$/m.test(cfg), 'Expected abi.type=x86_64');
+    assert(/^image\.sysdir\.1=\S*system-images\//m.test(cfg), 'image.sysdir.1 is missing');
   });
 
-  await test('安装失败原因翻译：NO_MATCHING_ABIS 给出中文指引', async () => {
+  await test('Install error for NO_MATCHING_ABIS explains the ARM library mismatch', async () => {
     const { friendlyInstallError } = require('../src/core/adb');
     const out = friendlyInstallError(
       'Performing Streamed Install\nadb.exe: failed to install x.apk: '
       + 'Failure [INSTALL_FAILED_NO_MATCHING_ABIS: Failed to extract native libraries, res=-113]',
     );
-    assert(out.includes('ARM 原生库'), `应解释 ARM 原生库问题：${out}`);
-    assert(out.includes('INSTALL_FAILED_NO_MATCHING_ABIS'), '应保留原始错误码');
+    assert(out.includes('ARM native libraries'), `Expected an ARM-library explanation: ${out}`);
+    assert(out.includes('INSTALL_FAILED_NO_MATCHING_ABIS'), 'The original error code should be preserved');
     const other = friendlyInstallError('Failure [INSTALL_FAILED_INVALID_APK: x]');
-    assert(other.includes('损坏') || other.includes('不完整'), `未知错误也应可读：${other}`);
+    assert(/corrupted|incomplete/i.test(other), `Unknown errors should remain readable: ${other}`);
   });
 
-  await test('镜像校验：区分有效 ISO9660 / 损坏 / 未下完', async () => {
+  await test('Image validation distinguishes valid, corrupt, and incomplete ISO9660 files', async () => {
     const p = new Provisioner(TMP);
     const mk = (file, size, writeMagic) => {
       const fd = fs.openSync(file, 'w');
@@ -256,34 +256,34 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
 
     const good = mk(path.join(TMP, 'good.iso'), 450 * 1024 * 1024, true);
     const a = p.inspectIso(good);
-    assert(a.ok && a.iso9660, `有效 ISO 被判无效：${a.reason}`);
+    assert(a.ok && a.iso9660, `Valid ISO was rejected: ${a.reason}`);
 
     const broken = mk(path.join(TMP, 'broken.iso'), 450 * 1024 * 1024, false);
     const b = p.inspectIso(broken);
-    assert(!b.ok && /ISO9660/.test(b.reason), `损坏镜像未被拦截：${JSON.stringify(b)}`);
+    assert(!b.ok && /ISO9660/.test(b.reason), `Corrupt image was not rejected: ${JSON.stringify(b)}`);
 
     const partial = mk(path.join(TMP, 'partial.iso'), 2 * 1024 * 1024, true);
     const c = p.inspectIso(partial);
-    assert(!c.ok && /未完成/.test(c.reason), `未下完的镜像未被拦截：${JSON.stringify(c)}`);
+    assert(!c.ok && /incomplete/i.test(c.reason), `An incomplete image was not rejected: ${JSON.stringify(c)}`);
 
     for (const f of [good, broken, partial]) fs.rmSync(f, { force: true });
   });
 
-  await test('远端 stat 列表解析（真实 mtime，避免无限重传）', async () => {
+  await test('Parse remote stat output and preserve real mtimes to avoid endless retransfers', async () => {
     const { parseStatList } = require('../src/core/adb');
     const rows = parseStatList('1794309868|1234|./a.txt\n1794309900|99|./sub/b.png');
-    assert(rows && rows.length === 2, `解析数量异常：${JSON.stringify(rows)}`);
-    assert(rows[0].rel === 'a.txt' && rows[0].size === 1234, '首行字段错误');
-    assert(rows[1].rel === 'sub/b.png', '子目录相对路径错误');
-    assert(rows[1].mtime === 1794309900000, 'mtime 未换算为毫秒');
-    assert(parseStatList('ls: /nope: No such file') === null, '非 stat 输出应返回 null 以便回退');
-    assert(Array.isArray(parseStatList('')) && parseStatList('').length === 0, '空目录应返回空数组');
+    assert(rows && rows.length === 2, `Unexpected number of parsed entries: ${JSON.stringify(rows)}`);
+    assert(rows[0].rel === 'a.txt' && rows[0].size === 1234, 'Incorrect first-row fields');
+    assert(rows[1].rel === 'sub/b.png', 'Incorrect relative path for subdirectory');
+    assert(rows[1].mtime === 1794309900000, 'mtime was not converted to milliseconds');
+    assert(parseStatList('ls: /nope: No such file') === null, 'Non-stat output should return null so the caller can fall back');
+    assert(Array.isArray(parseStatList('')) && parseStatList('').length === 0, 'An empty directory should return an empty array');
   });
 
   console.log('\n[engine.js]');
   const { Runtime } = require('../src/core/engine');
 
-  await test('QEMU 启动参数：安装模式挂载 ISO 并从光驱启动', async () => {
+  await test('QEMU arguments: boot from the ISO in install mode', async () => {
     const rt = new Runtime(TMP);
     rt._hv = { whpx: true };
     store.saveSettings({
@@ -291,35 +291,35 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       engine: { memoryMB: 4096, cores: 4 },
     });
     const args = rt.buildArgs({ install: true }).join(' ');
-    assert(args.includes('-cdrom C:/img/android.iso'), '缺少 -cdrom');
-    assert(/order=d/.test(args), '应从光驱启动');
-    assert(/accel=whpx/.test(args), '应使用 WHPX');
-    assert(/-cpu host/.test(args), 'WHPX 应使用 host CPU');
-    assert(/hostfwd=tcp:127\.0\.0\.1:5555-:5555/.test(args), '缺少 adb 端口转发');
-    assert(args.includes('-monitor tcp:127.0.0.1:5556'), '缺少 monitor');
-    assert(/-m 4096/.test(args), '内存参数错误');
+    assert(args.includes('-cdrom C:/img/android.iso'), 'Missing -cdrom');
+    assert(/order=d/.test(args), 'Expected boot from the CD-ROM');
+    assert(/accel=whpx/.test(args), 'Expected WHPX acceleration');
+    assert(/-cpu host/.test(args), 'WHPX should use the host CPU');
+    assert(/hostfwd=tcp:127\.0\.0\.1:5555-:5555/.test(args), 'Missing adb port forwarding');
+    assert(args.includes('-monitor tcp:127.0.0.1:5556'), 'Missing monitor');
+    assert(/-m 4096/.test(args), 'Incorrect memory argument');
   });
 
-  await test('QEMU 启动参数：正常启动从磁盘引导', async () => {
+  await test('QEMU arguments: boot from disk in normal mode', async () => {
     const rt = new Runtime(TMP);
     rt._hv = { whpx: false };
     const args = rt.buildArgs({ install: false }).join(' ');
-    assert(!args.includes('-cdrom'), '不应挂载 ISO');
-    assert(/order=c/.test(args), '应从硬盘启动');
-    assert(/accel=tcg/.test(args), '无 WHPX 应回退 TCG');
-    assert(/-cpu max/.test(args), 'TCG 应使用 max CPU');
-    assert(args.includes('if=virtio,format=qcow2'), '磁盘参数错误');
+    assert(!args.includes('-cdrom'), 'The ISO should not be mounted');
+    assert(/order=c/.test(args), 'Expected boot from disk');
+    assert(/accel=tcg/.test(args), 'TCG should be used when WHPX is unavailable');
+    assert(/-cpu max/.test(args), 'TCG should use max CPU');
+    assert(args.includes('if=virtio,format=qcow2'), 'Incorrect disk argument');
   });
 
-  await test('headless 模式隐藏虚拟机窗口', async () => {
+  await test('Headless mode hides the virtual machine window', async () => {
     const rt = new Runtime(TMP);
     rt._hv = { whpx: false };
     const args = rt.buildArgs({ headless: true }).join(' ');
-    assert(args.includes('-display none'), '应无窗口');
+    assert(args.includes('-display none'), 'Expected no display window');
   });
 
-  await test('QEMU monitor 协议：握手并下发命令', async () => {
-    // 模拟 QEMU monitor：连上后回 "(qemu) "，收到命令后回 ok
+  await test('QEMU monitor protocol: handshake and send a command', async () => {
+    // Simulate a QEMU monitor: return "(qemu) " on connect and "ok" after a command.
     const srv = net.createServer((sock) => {
       sock.write('QEMU 8.2.0 monitor - type \'help\' for more information\r\n(qemu) ');
       sock.on('data', (d) => {
@@ -331,20 +331,20 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
 
     const rt = new Runtime(TMP);
     await rt.monitorCmd('system_powerdown');
-    assert(srv.lastCmd === 'system_powerdown', `实际收到: ${srv.lastCmd}`);
+    assert(srv.lastCmd === 'system_powerdown', `Received:  ${srv.lastCmd}`);
     await new Promise((r) => srv.close(r));
   });
 
-  await test('未安装系统时 ensure 返回 needsSetup', async () => {
+  await test('ensure returns needsSetup when no system is installed', async () => {
     store.saveSettings({ runtime: { installed: false }, engine: { mode: 'builtin' } });
     const rt = new Runtime(TMP);
-    // 用假 adb 保证 isOnline 快速失败
+    // Use a fake adb client so isOnline fails quickly.
     const r = await rt.ensure({ onLog: () => {} });
-    assert(r.ok === false, '不应就绪');
+    assert(r.ok === false, 'The environment should not be ready');
     assert(['provision', 'install'].includes(r.needsSetup), `needsSetup=${r.needsSetup}`);
   });
 
-  await test('预热与点击并发时只拉起一次运行时（幂等，不重复开机器）', async () => {
+  await test('Concurrent prewarm and launch calls start the runtime only once', async () => {
     const rt = new Runtime(TMP);
     rt.provisioner.checkEnv = async () => ({ adb: { ok: true }, emulator: { ok: true }, sysimg: { ok: true } });
     rt.emulator.setPriority = async () => 0;
@@ -354,13 +354,13 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       await new Promise((r) => setTimeout(r, 60));
       return { ok: true, engine: 'emulator' };
     };
-    // 预热（启动 4 秒后自动跑）与用户点开应用（ensure）会同时发生
+    // Prewarm (scheduled four seconds after launch) can overlap with a user-triggered ensure call.
     const [a, b] = await Promise.all([rt.prewarm({}), rt.ensure({})]);
-    assert(calls === 1, `底层开机被触发 ${calls} 次，应只拉起一台模拟器`);
-    assert(a && a.ok && b && b.ok, '两条路径都应拿到就绪结果');
+    assert(calls === 1, `Runtime startup was triggered ${calls} times; only one emulator should start`);
+    assert(a && a.ok && b && b.ok, 'Both code paths should receive a ready result');
   });
 
-  await test('启动就绪判定：必须等到 boot_completed + 包管理器', async () => {
+  await test('Startup readiness requires boot_completed and the package manager', async () => {
     const rt = new Runtime(TMP);
     const calls = [];
     const fake = {
@@ -374,43 +374,43 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       },
     };
     const r = await rt.waitAndroidReady(fake, 5000, () => {});
-    assert(r.ok, '应当判定为已就绪');
-    assert(calls.some((c) => c.includes('sys.boot_completed')), '未检查 boot_completed');
-    assert(calls.some((c) => c.includes('pm path android')), '未检查包管理器');
+    assert(r.ok, 'Expected the runtime to be ready');
+    assert(calls.some((c) => c.includes('sys.boot_completed')), 'boot_completed was not checked');
+    assert(calls.some((c) => c.includes('pm path android')), 'Package manager was not checked');
   });
 
-  await test('系统未启动完成时返回阶段（kernel）', async () => {
+  await test('Return the kernel stage when Android has not finished booting', async () => {
     const rt = new Runtime(TMP);
     const fake = { isOnline: async () => true, connect: async () => true, shell: async () => '0' };
     const r = await rt.waitAndroidReady(fake, 1200, () => {});
-    assert(!r.ok && r.stage === 'kernel', `应停在 kernel 阶段：${JSON.stringify(r)}`);
+    assert(!r.ok && r.stage === 'kernel', `Expected the kernel stage: ${JSON.stringify(r)}`);
   });
 
-  console.log('\n[provision.js 兼容镜像 / 完整版]');
+  console.log('\n[provision.js compatibility image / full package]');
 
-  await test('playImageInfo 校验 API 34 兼容镜像完整性', async () => {
+  await test('playImageInfo validates the Android 14 compatibility image', async () => {
     const dir = path.join(TMP, 'apkstart', 'runtime', 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'kernel-ranchu'), 'k');
     const prov = new Provisioner(path.join(__dirname, '..'));
     fs.writeFileSync(path.join(dir, 'system.img'), Buffer.alloc(64));
-    assert(!prov.playImageInfo().ok, '过小的镜像不应判定为就绪');
+    assert(!prov.playImageInfo().ok, 'An undersized image must not be marked ready');
     fs.writeFileSync(path.join(dir, 'system.img'), Buffer.alloc(301 * 1024 * 1024));
     const info = prov.playImageInfo();
-    assert(info.ok && info.api === '34' && info.tag === 'google_apis_playstore', `应判定 API 34 兼容镜像就绪：${JSON.stringify(info)}`);
+    assert(info.ok && info.api === '34' && info.tag === 'google_apis_playstore', `Expected the API 34 compatibility image to be ready: ${JSON.stringify(info)}`);
   });
 
-  await test('完整版品牌资产与抖音联系入口就位', async () => {
+  await test('Full-package brand assets and Douyin contact link are present', async () => {
     const root = path.join(__dirname, '..');
-    assert(fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), '缺少抖音二维码图片');
-    assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), '缺少完整版运行时组装脚本');
+    assert(fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), 'Missing Douyin QR image');
+    assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), 'Missing full-runtime assembly script');
     const html = fs.readFileSync(path.join(root, 'src', 'ui', 'index.html'), 'utf8');
-    assert(html.includes('douyin-qr.jpg'), '关于区未引用抖音二维码');
-    assert(html.includes('https://v.douyin.com/9TIIxVCANig/'), '缺少抖音主页链接');
+    assert(html.includes('douyin-qr.jpg'), 'About section does not reference the Douyin QR image');
+    assert(html.includes('https://v.douyin.com/9TIIxVCANig/'), 'Missing Douyin profile URL');
   });
 
   console.log(results.join('\n'));
-  console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
+  console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }
   process.exit(failed ? 1 : 0);
 })();
