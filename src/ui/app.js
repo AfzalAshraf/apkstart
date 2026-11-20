@@ -694,54 +694,7 @@ function bindEvents() {
     $('#deployCard').classList.remove('hidden');
   });
 
-  bindWelcome();
-}
-
-const DOUYIN_URL = 'https://v.douyin.com/9TIIxVCANig/';
-
-function todayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-function openWelcome(manual = false) {
-  const dlg = $('#welcomeDialog');
-  if (!dlg) return;
-  const w = (state.settings && state.settings.welcome) || {};
-  $('#chkWelcomeDisable').checked = Boolean(w.disabled);
-  if (!dlg.open) dlg.showModal();
-  if (!manual) {
-    const next = { welcome: { ...w, lastDate: todayKey() } };
-    api.saveSettings(next).then((s) => { state.settings = s; }).catch(() => {});
-  }
-}
-
-async function closeWelcome() {
-  const dlg = $('#welcomeDialog');
-  if (dlg && dlg.open) dlg.close();
-  const disabled = Boolean($('#chkWelcomeDisable').checked);
-  const w = (state.settings && state.settings.welcome) || {};
-  if (Boolean(w.disabled) !== disabled) {
-    state.settings = await api.saveSettings({ welcome: { ...w, disabled, lastDate: todayKey() } });
-  }
-}
-
-function maybeShowDailyWelcome() {
-  const w = (state.settings && state.settings.welcome) || {};
-  if (w.disabled) return;
-  if (w.lastDate === todayKey()) return;
-  openWelcome(false);
-}
-
-function bindWelcome() {
-  const dlg = $('#welcomeDialog');
-  if (!dlg) return;
-  $('#btnWelcomeClose').addEventListener('click', closeWelcome);
-  $('#btnWelcomeOk').addEventListener('click', closeWelcome);
-  $('#btnWelcomeLink').addEventListener('click', (e) => api.openExternal(e.currentTarget.dataset.url || DOUYIN_URL));
-  $('#btnCommunity').addEventListener('click', () => openWelcome(true));
-  dlg.addEventListener('click', (e) => { if (e.target === dlg) closeWelcome(); });
 }
 
 bindEvents();
-refresh().then(() => maybeShowDailyWelcome());
+refresh();

@@ -9,7 +9,7 @@ This roadmap starts at the audited **v0.4.3** baseline and proceeds through **v0
 | Audited defect set | Complete: fixes #1–#22 are present in the working tree | Regressions are covered by the Node suites and source-level assertions. Keep these fixes intact while refactoring. |
 | Automated tests | Passing | `npm test`: 117 passed, 0 failed (8 parser/runtime tests, 25 engine tests, 84 focused regression tests). |
 | Renderer / preload / main IPC contracts | Static contract check passes | 63 preload `invoke` channels match 63 `ipcMain.handle` registrations; renderer and shell element references resolve. Electron end-to-end behavior still needs a Windows run. |
-| English operational material | Complete for the audited working tree | A repository-wide UTF-8 text scan found no Han characters in source, workflows, tests, documentation, guidance, or promotional copy; the English promotional graphics were regenerated from source. |
+| English operational material | Complete for the audited working tree | A repository-wide UTF-8 text scan found no Han characters in source, workflows, tests, documentation, or guidance. |
 | Graphify | Refreshed | Code-only graph regenerated from the current working tree; report and freshness metadata inspected in `graphify-out/`. |
 | Dependency advisories | Follow-up required before the next runtime release | `npm audit` reports 8 advisories (6 moderate, 2 high) in development/build dependencies, including the Electron 33.4.11 runtime shipped with the app. `npm audit --omit=dev` reports zero because Electron is a devDependency; the audit's Electron fix path is a major upgrade. No upgrade was attempted without Windows build and smoke validation. |
 
@@ -24,7 +24,7 @@ This roadmap starts at the audited **v0.4.3** baseline and proceeds through **v0
 - [x] Static contract check: all preload invokes have matching main-process handlers; all renderer/shell DOM IDs resolve; linked shell stylesheets exist.
 - [ ] Electron application smoke test on Windows: launch main window, install or open a test APK, embed the emulator window, rotate, minimize/maximize, close, and verify cleanup.
 - [x] English documentation, milestones, contributor guidance, and agent instructions are complete and internally consistent. A full repository text scan returned no Han-character matches.
-- [x] Graphify output is regenerated from the reconciled code tree and contains no stale code snapshot (`graphify update /home/user/apkstart --force`: 1,090 nodes, 2,446 edges, 65 communities; report and build metadata inspected).
+- [x] Graphify output is regenerated from the reconciled code tree and contains no stale code snapshot (`graphify update /home/user/apkstart --force`: 1,090 nodes, 2,446 edges, 65 code clusters; report and build metadata inspected).
 
 **Exit evidence:** attach the exact commands, platform/build used, and observed outcome to the session handoff. Do not mark the Windows-only gate complete from Node tests or static inspection alone.
 

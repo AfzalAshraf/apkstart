@@ -78,7 +78,6 @@ contextBridge.exposeInMainWorld('apkstart', {
   registerAssociation: () => ipcRenderer.invoke('assoc:register'),
   unregisterAssociation: () => ipcRenderer.invoke('assoc:unregister'),
   openDataDir: () => ipcRenderer.invoke('app:openData'),
-  openExternal: (url) => ipcRenderer.invoke('shell:external', url),
   openPath: (targetPath) => ipcRenderer.invoke('shell:openPath', targetPath),
 
   onProgress: (fn) => {

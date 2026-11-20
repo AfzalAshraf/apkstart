@@ -132,7 +132,7 @@ button { user-select: none; }
 .empty-title { margin-top: 9px; color: var(--text); font-size: 16px; font-weight: 700; }
 .empty-sub { max-width: 540px; margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 
-/* Settings and welcome dialogs use native <dialog> for keyboard and focus behavior. */
+/* The settings dialog uses native <dialog> for keyboard and focus behavior. */
 dialog.modal {
   width: min(920px, calc(100vw - 36px)); max-width: 920px; max-height: min(88vh, 900px);
   padding: 0; border: 1px solid rgba(255,255,255,.7); color: var(--text); background: #fff;
@@ -178,18 +178,6 @@ input:focus, select:focus { border-color: #78c59b; box-shadow: 0 0 0 3px rgba(15
 .adv summary { color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 650; }
 .modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-top: 1px solid var(--line); background: #fbfdfc; }
 .modal-actions > div { display: flex; gap: 7px; }
-.welcome-modal { width: min(460px, calc(100vw - 32px)); max-width: 460px; }
-.welcome-card { position: relative; padding: 24px; text-align: center; }
-.welcome-close { position: absolute; top: 10px; right: 10px; }
-.welcome-badge { display: inline-flex; padding: 6px 10px; border-radius: 999px; color: #0b724b; background: #e7f8ef; font-size: 10px; font-weight: 750; letter-spacing: .3px; }
-.welcome-title { margin: 15px 10px 6px; color: var(--text); font-size: 18px; line-height: 1.35; }
-.welcome-sub { max-width: 340px; margin: 0 auto 14px; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.welcome-qr-wrap { display: grid; place-items: center; margin: 12px 0; }
-.welcome-qr { width: 190px; max-width: 60vw; border: 1px solid var(--line); border-radius: 13px; }
-.welcome-actions { display: flex; gap: 8px; margin-top: 12px; }
-.welcome-actions .btn { flex: 1; justify-content: center; }
-.welcome-mute { display: flex; justify-content: center; align-items: center; gap: 7px; margin-top: 14px; color: var(--muted); font-size: 11px; }
-.welcome-mute input { accent-color: var(--brand); }
 
 @media (max-width: 1050px) {
   .topbar { align-items: flex-start; flex-direction: column; gap: 10px; }

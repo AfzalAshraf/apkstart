@@ -457,20 +457,28 @@ async function runDeploy() {
   broadcast('progress', {
     kind: 'deploy',
     busy: true,
-    message: 'Preparing Android runtime download (~800 MB one-time setup)...',
+    message: 'Starting one-time Android runtime setup (often over 1 GB)...',
     ratio: 0,
   });
   try {
     await provisioner.deploy({
       signal: deployAbort.signal,
       onProgress: (p) => {
-        const mb = p.received ? ` (${(p.received / 1048576).toFixed(1)} MB)` : '';
+        const base = p.message || `${p.label || p.stage}`;
+        const hasReceived = Number.isFinite(p.received) && p.received >= 0;
+        const hasTotal = Number.isFinite(p.total) && p.total > 0;
+        const transferred = hasReceived
+          ? ` · ${(p.received / 1048576).toFixed(1)}${hasTotal ? ` / ${(p.total / 1048576).toFixed(1)}` : ''} MiB`
+          : '';
+        const speed = Number.isFinite(p.speed) && p.speed > 0
+          ? ` · ${(p.speed / 1048576).toFixed(1)} MiB/s`
+          : '';
         broadcast('progress', {
           kind: 'deploy',
           busy: true,
           step: p.step,
           ratio: p.ratio || (Number.isFinite(p.percent) ? p.percent / 100 : 0),
-          message: p.message || `${p.label || p.stage}${mb}`,
+          message: `${base}${transferred}${speed}`,
         });
       },
     });
@@ -1183,9 +1191,6 @@ function registerIpc() {
   ipcMain.handle('shell:openPath', (_e, targetPath) => {
     if (!isAllowedLocalPath(targetPath)) return { ok: false, error: 'Path is outside ApkStart directories' };
     return shell.openPath(path.resolve(targetPath));
-  });
-  ipcMain.handle('shell:external', (_e, url) => {
-    if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
   });
 }
 

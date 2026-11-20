@@ -47,8 +47,7 @@
     <div class="deploy-info">
       <div class="deploy-title">⚡ One-Time Setup: Built-In Android Runtime Not Yet Installed</div>
       <div class="deploy-desc">
-        ApkStart includes a dedicated headless Android engine (powered by Windows Hyper-V / WHPX hardware virtualization — no BlueStacks or external emulator required).
-        The first-time setup downloads ~800 MB once; afterwards, double-clicking any <code>.apk</code> or desktop shortcut launches apps directly.
+        First-time setup downloads and unpacks the Android runtime (often over 1 GB; time depends on your connection and disk). Keep ApkStart open — progress and errors appear above. Afterwards, double-clicking any <code>.apk</code> or desktop shortcut launches apps directly.
       </div>
     </div>
     <div class="deploy-btns">
@@ -72,7 +71,6 @@
         <button class="chip" id="btnSyncShare">🔄 Sync Shared Folder</button>
         <button class="chip" id="btnAssoc">🔗 Associate .apk Double-Click</button>
         <button class="chip" id="btnRebuildShortcutsTop">🖥️ Rebuild Desktop Shortcuts</button>
-        <button class="chip" id="btnCommunity" title="Support &amp; feedback community">💬 Community &amp; Feedback</button>
       </div>
       <div class="qb-right">
         <button class="chip danger hidden" id="btnStopEngine">⏹ Stop Android Engine</button>
@@ -507,27 +505,6 @@
           <button type="button" class="btn primary" id="btnSaveSettings">Save Preferences</button>
         </div>
       </div>
-    </div>
-  </dialog>
-
-  <!-- Community & Feedback Dialog -->
-  <dialog id="welcomeDialog" class="modal welcome-modal">
-    <div class="welcome-card">
-      <button type="button" class="icon-btn welcome-close" id="btnWelcomeClose" title="Close">✕</button>
-      <div class="welcome-badge">ApkStart Official Community</div>
-      <h3 class="welcome-title">Questions, Tips, or App Compatibility Requests?</h3>
-      <p class="welcome-sub">Scan the QR code below or open the official creator channel for release notes, troubleshooting tips, and direct feedback.</p>
-      <div class="welcome-qr-wrap">
-        <img src="assets/douyin-qr.jpg" alt="Official Channel QR Code" class="welcome-qr" />
-      </div>
-      <div class="welcome-actions">
-        <button type="button" class="btn primary" id="btnWelcomeLink" data-url="https://v.douyin.com/9TIIxVCANig/">🔗 Open Creator Channel in Browser</button>
-        <button type="button" class="btn ghost" id="btnWelcomeOk">Continue to ApkStart</button>
-      </div>
-      <label class="welcome-mute">
-        <input type="checkbox" id="chkWelcomeDisable" />
-        <span>Don't show this welcome card automatically on startup</span>
-      </label>
     </div>
   </dialog>
 

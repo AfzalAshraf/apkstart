@@ -282,7 +282,7 @@ class Installer {
       onLog: (m) => emit({ stage: 'runtime', message: m }),
     });
     if (!rt.ok && rt.needsSetup && store.getSettings().autoDeploy !== false) {
-      emit({ stage: 'runtime', message: 'First launch: automatically deploying Android runtime (~1.9 GB one-time)...' });
+      emit({ stage: 'runtime', message: 'First launch: downloading the Android runtime (a large one-time download, often over 1 GB)...' });
       const p = this.runtime.provisioner;
       const env0 = await p.checkEnv();
       const step = (msg) => (pr) => emit({

@@ -77,10 +77,6 @@ const DEFAULT_SETTINGS = {
   deviceSharedDir: '/sdcard/ApkStartShared',
   hideAfterLaunch: false,
   notifyOnInstall: true,
-  welcome: {
-    disabled: false,
-    lastDate: '',
-  },
 };
 
 function ensureDirs() {

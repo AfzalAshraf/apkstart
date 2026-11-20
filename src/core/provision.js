@@ -676,6 +676,13 @@ class Provisioner {
         const rel = e.name.replace(/^\/+/, '').replace(/\\/g, '/');
         const out = path.resolve(destAbs, rel);
         if (out !== destAbs && !out.startsWith(destAbs + path.sep)) continue;
+        if (onProgress) {
+          onProgress({
+            stage: 'extract',
+            percent: Math.round((done / entries.length) * 100),
+            message: `Extracting (${done + 1}/${entries.length}): ${path.basename(rel)}...`,
+          });
+        }
         fs.mkdirSync(path.dirname(out), { recursive: true });
         await zip.pipeTo(e.name, fs.createWriteStream(out));
         done++;
@@ -683,7 +690,7 @@ class Provisioner {
           onProgress({
             stage: 'extract',
             percent: Math.round((done / entries.length) * 100),
-            message: `Extracting (${done}/${entries.length})...`,
+            message: `Extracted ${done}/${entries.length} files...`,
           });
         }
       }

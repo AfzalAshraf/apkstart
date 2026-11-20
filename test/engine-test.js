@@ -189,7 +189,10 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || 'Assertion failed
 
     const out = path.join(TMP, 'unzip');
     const p = new Provisioner(TMP);
-    await p.extractZip(zipPath, out);
+    const progress = [];
+    await p.extractZip(zipPath, out, (item) => progress.push(item));
+    assert(progress.some((item) => item.stage === 'extract' && item.message.includes('adb.exe')),
+      'Extraction must report the current filename before unpacking');
     assert(fs.readFileSync(path.join(out, 'platform-tools', 'adb.exe')).toString() === 'fake-adb-binary', 'Extracted contents do not match');
     assert(new ZipArchive(fs.readFileSync(zipPath)).has('platform-tools/adb.exe'), 'ZIP entry could not be read');
   });
@@ -400,13 +403,20 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || 'Assertion failed
     assert(info.ok && info.api === '34' && info.tag === 'google_apis_playstore', `Expected the API 34 compatibility image to be ready: ${JSON.stringify(info)}`);
   });
 
-  await test('Full-package brand assets and Douyin contact link are present', async () => {
+  await test('App UI excludes social promotion and explains the large runtime download', async () => {
     const root = path.join(__dirname, '..');
-    assert(fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), 'Missing Douyin QR image');
     assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), 'Missing full-runtime assembly script');
-    const html = fs.readFileSync(path.join(root, 'src', 'ui', 'index.html'), 'utf8');
-    assert(html.includes('douyin-qr.jpg'), 'About section does not reference the Douyin QR image');
-    assert(html.includes('https://v.douyin.com/9TIIxVCANig/'), 'Missing Douyin profile URL');
+    const surfaces = [
+      'src/ui/index.html', 'src/ui/app.js', 'src/ui/app.css', 'src/ui/theme.css',
+      'src/preload.js', 'src/main.js',
+    ].map((file) => fs.readFileSync(path.join(root, file), 'utf8')).join('\n');
+    assert(!/community|feedback|douyin|wechat|creator channel|qr code|welcomeDialog|shell:external|openExternal/i.test(surfaces),
+      'Social promotion or external creator links remain in the app');
+    assert(!fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), 'Douyin QR image should not ship with the app');
+    assert(!fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'wechat-qr.jpg')), 'WeChat QR image should not ship with the app');
+    assert(!fs.existsSync(path.join(root, 'docs', 'promo')), 'Promo-only documentation should be removed from this clean source tree');
+    assert(surfaces.includes('often over 1 GB'), 'Runtime setup should disclose the download can exceed 1 GB');
+    assert(!surfaces.includes('~800 MB'), 'Do not show a misleading 800 MB estimate');
   });
 
   console.log(results.join('\n'));
